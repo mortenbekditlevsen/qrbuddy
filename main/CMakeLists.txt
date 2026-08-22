@@ -87,4 +87,6 @@ target_sources(${COMPONENT_LIB}
     Integer.swift
     GATTServer.swift
     NimbleUUID.swift
+    Button.swift
+    LED.swift
 )

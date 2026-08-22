@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <stdio.h>
+#include <math.h>
 
 #ifndef MYNEWT_VAL_BLE_GATT_CSFC_SIZE
 #define MYNEWT_VAL_BLE_GATT_CSFC_SIZE 0
@@ -19,6 +20,8 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "sdkconfig.h"
+#include "rom/ets_sys.h"
+
 #include "nimble/ble.h"
 #include "nimble/transport.h"
 #include "host/ble_hs.h"
