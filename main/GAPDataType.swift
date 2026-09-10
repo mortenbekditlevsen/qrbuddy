@@ -39,7 +39,13 @@ public extension GAPDataType {
     ///
     /// Core Specification Supplement, Part A, section 1.3
     static var flags: GAPDataType                       { 0x01 }
-    
+
+    /// Incomplete List of 128-bit Service Class UUIDs
+    static var incompleteListOf128BitServiceUUIDs: GAPDataType { 0x06 }
+
+    /// Complete List of 128-bit Service Class UUIDs
+    static var completeListOf128BitServiceUUIDs: GAPDataType { 0x07 }
+
     /// Shortened Local Name
     static var shortLocalName: GAPDataType              { 0x08 }
     

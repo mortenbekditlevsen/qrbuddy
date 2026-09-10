@@ -1,18 +1,22 @@
 #include "rgb_tile.h"
 
-lv_timer_t *rgb_tile_timer;
-
-#define BG_COLOR_MAX 3
-uint32_t bg_color_arr[BG_COLOR_MAX] = {0x000000, 0x000000, 0x000000};
-uint16_t bg_color_index = 1;
-
 #include "qrcodegen.h"
+#include "bsp_display.h"
 
 #define QR_PX_PER_MODULE 3
+#define QR_QUIET_MODULES 4   // spec-recommended quiet zone (white border) on every side
 #define QR_MAX_MODULES   qrcodegen_BUFFER_LEN_FOR_VERSION(40) // generous upper bound
+#define QR_VISIBLE_SECONDS 60  // how long the QR code stays on screen
+#define QR_BACKLIGHT     20    // backlight % while a QR code is on screen
 
 static uint8_t qr_buf[177][177]; // 177 = max modules at version 40
 static int qr_modules = 0;
+static bool qr_visible = false;        // whether qr_draw_event_cb should paint anything
+
+static lv_obj_t *obj_rgb_tile;
+static lv_obj_t *qr_countdown_label;   // "seconds left" label, hidden while no QR
+static lv_timer_t *qr_tick_timer;      // 1 Hz countdown timer, paused while no QR
+static int qr_seconds_left;
 
 static bool qr_generate(const char * text)
 {
@@ -43,6 +47,7 @@ static bool qr_generate(const char * text)
 static void qr_draw_event_cb(lv_event_t * e)
 {
     if (lv_event_get_code(e) != LV_EVENT_DRAW_POST) return;
+    if (!qr_visible || qr_modules <= 0) return;
 
     lv_obj_t * obj = lv_event_get_target(e);
     lv_layer_t * layer = lv_event_get_layer(e);
@@ -51,14 +56,13 @@ static void qr_draw_event_cb(lv_event_t * e)
     lv_obj_get_coords(obj, &obj_coords);
 
     int32_t obj_w = lv_area_get_width(&obj_coords);
-    int32_t obj_h = lv_area_get_height(&obj_coords);
     int32_t qr_px = qr_modules * QR_PX_PER_MODULE;
+    int32_t quiet_px = QR_QUIET_MODULES * QR_PX_PER_MODULE;
 
-    // Center the QR code's origin within obj
+    // Center horizontally; sit near the top so the countdown label has room below.
     int32_t origin_x = obj_coords.x1 + (obj_w - qr_px) / 2;
-    int32_t origin_y = obj_coords.y1 + (obj_h - qr_px) / 2;
+    int32_t origin_y = obj_coords.y1 + quiet_px;
 
-    // White background, sized exactly to the QR code
     lv_draw_rect_dsc_t bg_dsc;
     lv_draw_rect_dsc_init(&bg_dsc);
     bg_dsc.bg_color = lv_color_white();
@@ -67,10 +71,10 @@ static void qr_draw_event_cb(lv_event_t * e)
     bg_dsc.border_width = 0;
 
     lv_area_t bg_area;
-    bg_area.x1 = origin_x;
-    bg_area.y1 = origin_y;
-    bg_area.x2 = origin_x + qr_px - 1;
-    bg_area.y2 = origin_y + qr_px - 1;
+    bg_area.x1 = origin_x - quiet_px;
+    bg_area.y1 = origin_y - quiet_px;
+    bg_area.x2 = origin_x + qr_px + quiet_px - 1;
+    bg_area.y2 = origin_y + qr_px + quiet_px - 1;
 
     lv_draw_rect(layer, &bg_dsc, &bg_area);
 
@@ -101,29 +105,55 @@ static void qr_draw_event_cb(lv_event_t * e)
         }
     }
 }
-static lv_obj_t *obj_rgb_tile;
-void lv_timer_show_color_tile_cb(lv_timer_t *timer)
-{
-    lv_obj_set_style_bg_color(obj_rgb_tile, lv_color_hex(bg_color_arr[bg_color_index]), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(obj_rgb_tile, LV_OPA_COVER, LV_PART_MAIN);
 
-    if (++bg_color_index >= BG_COLOR_MAX)
-    {
-        bg_color_index = 0;
+/* Take the QR code off screen: stop the countdown, blank the tile, backlight off. */
+static void hide_qr(void)
+{
+    lv_timer_pause(qr_tick_timer);
+    qr_visible = false;
+    if (qr_countdown_label) {
+        lv_obj_add_flag(qr_countdown_label, LV_OBJ_FLAG_HIDDEN);
     }
+    if (obj_rgb_tile) {
+        lv_obj_invalidate(obj_rgb_tile);
+    }
+    bsp_display_set_brightness(0);
 }
+
+/* 1 Hz while a QR code is showing. Runs on the LVGL task (holding the port
+ * lock), same as qr_draw_event_cb. */
+static void qr_tick_cb(lv_timer_t *timer)
+{
+    LV_UNUSED(timer);
+    qr_seconds_left--;
+    if (qr_seconds_left <= 0) {
+        hide_qr();
+        return;
+    }
+    lv_label_set_text_fmt(qr_countdown_label, "%d", qr_seconds_left);
+}
+
 void rgb_tile_init(lv_obj_t *parent)
 {
     obj_rgb_tile = parent;
-    lv_obj_set_style_bg_color(obj_rgb_tile, lv_color_hex(bg_color_arr[0]), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(obj_rgb_tile, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(obj_rgb_tile, LV_OPA_COVER, LV_PART_MAIN);
-    rgb_tile_timer = lv_timer_create(lv_timer_show_color_tile_cb, 2000, NULL);
 
-    qr_generate("https://firebasestorage.googleapis.com/v0/b/ka-ching-base-staging.appspot.com/o/r%2F-LQ8SQzDKW9pej0jK7cE%2FE377645E%2FC9385D73.html?alt=media");
+    qr_countdown_label = lv_label_create(parent);
+    lv_obj_set_style_text_font(qr_countdown_label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(qr_countdown_label, lv_color_white(), LV_PART_MAIN);
+    lv_obj_align(qr_countdown_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_add_flag(qr_countdown_label, LV_OBJ_FLAG_HIDDEN);
+
+    qr_tick_timer = lv_timer_create(qr_tick_cb, 1000, NULL);
+    lv_timer_pause(qr_tick_timer);
+
     lv_obj_add_event_cb(parent, qr_draw_event_cb, LV_EVENT_DRAW_POST, NULL);
+
+    rgb_tile_show_qr("https://ka-ching.dk");
 }
 
-/* Regenerate the QR code and repaint the tile.
+/* Regenerate the QR code, repaint the tile, and (re)start the countdown.
  * The caller MUST already hold the LVGL port lock (lvgl_port_lock), because this
  * mutates qr_buf/qr_modules which qr_draw_event_cb reads on the LVGL task. */
 void rgb_tile_show_qr(const char *text)
@@ -131,8 +161,20 @@ void rgb_tile_show_qr(const char *text)
     if (!qr_generate(text)) {
         return; /* text too long for the fixed QR version; keep the previous code */
     }
+    qr_visible = true;
+    bsp_display_set_brightness(QR_BACKLIGHT);   // wake the backlight for the QR
+
+    qr_seconds_left = QR_VISIBLE_SECONDS;
+    if (qr_countdown_label) {
+        lv_label_set_text_fmt(qr_countdown_label, "%d", qr_seconds_left);
+        lv_obj_remove_flag(qr_countdown_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (qr_tick_timer) {
+        lv_timer_reset(qr_tick_timer);    // full 1 s before the first decrement
+        lv_timer_resume(qr_tick_timer);
+    }
+
     if (obj_rgb_tile) {
         lv_obj_invalidate(obj_rgb_tile);
     }
 }
-

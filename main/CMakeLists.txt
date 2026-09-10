@@ -96,6 +96,7 @@ target_sources(${COMPONENT_LIB}
     GAPDataType.swift
     GAPFlags.swift
     GAPShortLocalName.swift
+    GAPServiceUUIDs.swift
     GAPManufacturerSpecificData.swift
     UInt128.swift
     UUID.swift

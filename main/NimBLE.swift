@@ -65,6 +65,12 @@ public struct GAP: ~Copyable {
         address: BluetoothAddress? = nil,
         parameters: ble_gap_adv_params = ble_gap_adv_params(conn_mode: UInt8(BLE_GAP_CONN_MODE_NON), disc_mode: UInt8(BLE_GAP_DISC_MODE_GEN), itvl_min: 0, itvl_max: 0, channel_map: 0, filter_policy: 0, high_duty_cycle: 0)
     ) throws(NimBLEError) {
+        // Remember the configuration so `_gap_callback` can bring advertising
+        // back up after a disconnect (NimBLE stops advertising on its own the
+        // moment a central connects).
+        advertisingOwnAddrType = addressType.rawValue
+        advertisingParams = parameters
+        advertisingConfigured = true
         var address = ble_addr_t(
             type: 0,
             val: (address ?? .zero).bytes
@@ -95,7 +101,49 @@ public struct GAP: ~Copyable {
     }
 }
 
+// Last advertising configuration, cached by `GAP.startAdvertising` so that the
+// GAP event handler can restart advertising after a disconnect. Written from the
+// task that starts advertising (once, at startup) and read from the NimBLE host
+// task — the write happens-before any connection, so no locking is needed.
+internal var advertisingOwnAddrType: UInt8 = UInt8(BLE_OWN_ADDR_PUBLIC)
+internal var advertisingParams = ble_gap_adv_params()
+internal var advertisingConfigured = false
+
+/// Re-arm undirected connectable advertising with the last-used configuration.
+/// Safe to call from inside `_gap_callback` (this is what NimBLE's own
+/// peripheral examples do in their disconnect handler).
+@discardableResult
+internal func restartAdvertising() -> Int32 {
+    guard advertisingConfigured, ble_gap_adv_active() == 0 else { return 0 }
+    var address = ble_addr_t(type: 0, val: BluetoothAddress.zero.bytes)
+    var parameters = advertisingParams
+    return ble_gap_adv_start(
+        advertisingOwnAddrType, &address, BLE_HS_FOREVER, &parameters, _gap_callback, nil
+    )
+}
+
 internal func _gap_callback(event: UnsafeMutablePointer<ble_gap_event>?, context: UnsafeMutableRawPointer?) -> Int32 {
+    guard let event else { return 0 }
+
+    switch Int32(event.pointee.type) {
+    case BLE_GAP_EVENT_DISCONNECT:
+        // Central disconnected — advertising stopped when it connected, so
+        // start it again or the device stays unreachable until a power cycle.
+        restartAdvertising()
+
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        // Advertising ended on its own (shouldn't with BLE_HS_FOREVER, but be safe).
+        restartAdvertising()
+
+    case BLE_GAP_EVENT_CONNECT:
+        // A failed connection attempt also leaves advertising stopped.
+        if event.pointee.connect.status != 0 {
+            restartAdvertising()
+        }
+
+    default:
+        break
+    }
     return 0
 }
 

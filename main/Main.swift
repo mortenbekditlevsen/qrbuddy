@@ -31,14 +31,14 @@ func app_main() {
         try setupGATTServer()
         print("GATT server registered")
 
-        // Estimote iBeacon B9407F30-F5F8-466E-AFF9-25556B57FE6D
-        // Major 0x01 Minor 0x01
-        guard let uuid = UUID(uuidString: "B9407F30-F5F8-466E-AFF9-25556B57FE6D") else {
-            fatalError("Invalid UUID string")
+        // Advertise the control service UUID so a central (e.g. an iOS app doing
+        // scanForPeripherals(withServices:)) can discover and filter for us.
+        guard let controlServiceUUID = UUID(uuidString: controlServiceUUIDString) else {
+            fatalError("Invalid control service UUID")
         }
-        let beacon = AppleBeacon(uuid: uuid, major: 0x01, minor: 0x01, rssi: -10)
         let flags: GAPFlags = [.lowEnergyGeneralDiscoverableMode, .notSupportedBREDR]
-        let advertisement = LowEnergyAdvertisingData(beacon: beacon, flags: flags)
+        let serviceUUIDs = GAPCompleteListOf128BitServiceUUIDs(uuids: [controlServiceUUID])
+        let advertisement: LowEnergyAdvertisingData = GAPDataEncoder.encode(flags, serviceUUIDs)
         try bluetooth.gap.setAdvertisement(advertisement)
 
         // set scan response
