@@ -6,3 +6,25 @@ CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_HCI_EVT_BUF_SIZE=70
 CONFIG_BT_NIMBLE_EXT_ADV=n
+# Large enough that a 256-byte property value fits in a single ATT Write/Read
+# PDU (MTU - 3 payload) instead of needing Write Long / Read Blob.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=512
+
+CONFIG_IDF_TARGET="esp32c6"
+
+# 16 MB flash + custom partition table (partitions.csv) so the app has room
+# for the LVGL + BLE + display binary (~1.7 MB, well over the 1 MB single-app default).
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+CONFIG_LV_COLOR_16_SWAP=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+
+## LVGL8 ##
+CONFIG_LV_MEM_SIZE_KILOBYTES=48
+
+
+CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE=n

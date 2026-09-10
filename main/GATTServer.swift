@@ -23,14 +23,23 @@ private let propertyUUIDStrings: [String] = [
 
 private let propertyCount = propertyUUIDStrings.count
 
+/// Maximum stored length of each property's value, in bytes.
+/// Property 0 (`6E400011`) is a UTF-8 text buffer of up to 256 bytes; the
+/// others are fixed 4-byte values.
+private let propertyMaxLength: [Int] = [256, 4, 4, 4, 4]
+
+/// Whether a property's payload is treated as UTF-8 text (validated on write,
+/// readable as a `String`) rather than a fixed 4-byte value.
+private func isTextProperty(_ index: Int) -> Bool { index == 0 }
+
 // MARK: - Persistent State
 
 /// Current value of each property. Only ever touched from Swift (never aliased
-/// by a raw pointer handed to C), so a plain array is safe here.
-private var propertyStorage: [[UInt8]] = Array(
-    repeating: [0, 0, 0, 0],
-    count: propertyCount
-)
+/// by a raw pointer handed to C), so a plain array is safe here. Text properties
+/// start empty; fixed properties start as 4 zero bytes.
+private var propertyStorage: [[UInt8]] = (0 ..< propertyCount).map { index in
+    isTextProperty(index) ? [] : [0, 0, 0, 0]
+}
 
 /// Attribute handles NimBLE assigns to each characteristic's value at registration time.
 /// Allocated as raw storage (not a Swift Array) because `ble_gatt_chr_def.val_handle`
@@ -79,11 +88,25 @@ func property_access_cb(
         return result == 0 ? 0 : Int32(BLE_ATT_ERR_INSUFFICIENT_RES)
 
     case UInt8(BLE_GATT_ACCESS_OP_WRITE_CHR):
-        var value: [UInt8] = [0, 0, 0, 0]
-        let result = value.withUnsafeMutableBytes { buf in
-            ble_hs_mbuf_to_flat(ctxt.pointee.om, buf.baseAddress, UInt16(buf.count), nil)
+        // Flatten the incoming mbuf into a buffer sized to this property's max.
+        // ble_hs_mbuf_to_flat fails (BLE_HS_EMSGSIZE) if the write is larger,
+        // which is how the 256-byte / 4-byte caps are enforced.
+        var buffer = [UInt8](repeating: 0, count: propertyMaxLength[index])
+        var writtenLen: UInt16 = 0
+        let result = buffer.withUnsafeMutableBytes { buf in
+            ble_hs_mbuf_to_flat(ctxt.pointee.om, buf.baseAddress, UInt16(buf.count), &writtenLen)
         }
-        guard result == 0 else { return 1 }   // reject anything that isn't exactly 4 bytes
+        guard result == 0 else { return Int32(BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN) }
+
+        let value = Array(buffer[..<Int(writtenLen)])
+        if isTextProperty(index) {
+            // Reject payloads that aren't well-formed UTF-8.
+            guard String(validating: value, as: UTF8.self) != nil else {
+                return Int32(BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN)
+            }
+        } else {
+            guard writtenLen == 4 else { return Int32(BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN) }
+        }
         withPropertyLock { propertyStorage[index] = value }
         return 0
 
@@ -141,13 +164,29 @@ func readPropertyValue(index: Int) -> [UInt8] {
     return withPropertyLock { propertyStorage[index] }
 }
 
+/// Read a text property's current value as a `String`. The stored bytes are
+/// always valid UTF-8 (enforced on every write), so decoding can't fail.
+func readPropertyString(index: Int) -> String {
+    precondition(isTextProperty(index), "Property \(index) is not a text property")
+    return String(decoding: readPropertyValue(index: index), as: UTF8.self)
+}
+
 // MARK: - Firmware-side updates
 
 /// Call from firmware logic (not from a BLE write) to change a property's value
 /// and notify any subscribed centrals.
 func updatePropertyValue(index: Int, value: [UInt8]) {
-    precondition(value.count == 4, "Properties are fixed at 4 bytes")
     precondition(index >= 0 && index < propertyCount)
+    precondition(value.count <= propertyMaxLength[index],
+                 "Property \(index) holds at most \(propertyMaxLength[index]) bytes")
+    precondition(isTextProperty(index) || value.count == 4,
+                 "Fixed properties are exactly 4 bytes")
     withPropertyLock { propertyStorage[index] = value }
     ble_gatts_chr_updated(propertyHandles[index])
+}
+
+/// Set a text property from a `String` and notify subscribed centrals.
+func updatePropertyString(index: Int, value: String) {
+    precondition(isTextProperty(index), "Property \(index) is not a text property")
+    updatePropertyValue(index: index, value: Array(value.utf8))
 }

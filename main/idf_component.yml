@@ -1,0 +1,8 @@
+dependencies:
+  espressif/button: '*'
+  espressif/cmake_utilities: '*'
+  espressif/esp_lcd_touch: '*'
+  espressif/esp_lcd_touch_cst816s: '*'
+  espressif/esp_lvgl_port: '*'
+  lvgl/lvgl: '*'
+  espressif/esp_codec_dev: '*'

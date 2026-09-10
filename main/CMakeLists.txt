@@ -3,8 +3,9 @@ idf_component_register(
     SRCS /dev/null # We don't have any C++ sources
     PRIV_INCLUDE_DIRS "."
     LDFRAGMENTS "linker.lf"
-    REQUIRES bt driver
+    REQUIRES bt driver lvgl_ui
 )
+
 
 idf_build_get_property(target IDF_TARGET)
 idf_build_get_property(arch IDF_TARGET_ARCH)
@@ -52,6 +53,21 @@ target_compile_options(${COMPONENT_LIB} PUBLIC "$<$<COMPILE_LANGUAGE:Swift>:SHEL
 
     -import-bridging-header ${CMAKE_CURRENT_LIST_DIR}/BridgingHeader.h
     >")
+
+# Pick the Swift compiler explicitly. The Xcode-bundled toolchain (/usr/bin/swiftc) has no
+# RISC-V LLVM target and crashes while generating the bridging-header PCH, so prefer the
+# swiftly shim (which honours the project's .swift-version), then any other swiftc on PATH.
+if(NOT CMAKE_Swift_COMPILER)
+    find_program(SWIFTLY_SWIFTC swiftc
+        PATHS "$ENV{SWIFTLY_BIN_DIR}" "$ENV{HOME}/.swiftly/bin"
+        NO_DEFAULT_PATH)
+    if(SWIFTLY_SWIFTC)
+        set(CMAKE_Swift_COMPILER "${SWIFTLY_SWIFTC}")
+    else()
+        find_program(CMAKE_Swift_COMPILER swiftc)
+    endif()
+    message(STATUS "Swift compiler: ${CMAKE_Swift_COMPILER}")
+endif()
 
 # Enable Swift support in CMake, force Whole Module builds (required by Embedded Swift), and use "CMAKE_Swift_COMPILER_WORKS" to
 # skip the trial compilations which don't (yet) correctly work when cross-compiling.
