@@ -61,13 +61,15 @@ static void qr_draw_event_cb(lv_event_t * e)
 
     // Center horizontally; sit near the top so the countdown label has room below.
     int32_t origin_x = obj_coords.x1 + (obj_w - qr_px) / 2;
-    int32_t origin_y = obj_coords.y1 + quiet_px;
+    int32_t origin_y = obj_coords.y1 + quiet_px + 20;
 
     lv_draw_rect_dsc_t bg_dsc;
     lv_draw_rect_dsc_init(&bg_dsc);
     bg_dsc.bg_color = lv_color_white();
     bg_dsc.bg_opa = LV_OPA_COVER;
-    bg_dsc.radius = 0;
+    // Round the corners, but no more than the quiet zone is wide so the rounding
+    // stays in the white border and never clips a QR finder pattern.
+    bg_dsc.radius = quiet_px;
     bg_dsc.border_width = 0;
 
     lv_area_t bg_area;
@@ -142,7 +144,7 @@ void rgb_tile_init(lv_obj_t *parent)
     qr_countdown_label = lv_label_create(parent);
     lv_obj_set_style_text_font(qr_countdown_label, &lv_font_montserrat_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(qr_countdown_label, lv_color_white(), LV_PART_MAIN);
-    lv_obj_align(qr_countdown_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_align(qr_countdown_label, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(qr_countdown_label, LV_OBJ_FLAG_HIDDEN);
 
     qr_tick_timer = lv_timer_create(qr_tick_cb, 1000, NULL);
