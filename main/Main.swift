@@ -105,7 +105,15 @@ func app_main() {
             }
         }
 
-        ets_delay_us(500)
+        // ets_delay_us is a busy-wait (it spins on a cycle counter, never
+        // yielding to the scheduler) -- using it to pace this loop meant the
+        // main task was effectively always "ready" and never blocked, which
+        // starves the IDLE task of CPU time on this single-core chip whenever
+        // nothing preempts main. vTaskDelay actually blocks/yields, letting
+        // IDLE (and everything else) run. 1 tick == 10ms here
+        // (CONFIG_FREERTOS_HZ=100) -- still effectively instant for a
+        // human-facing BLE property poll.
+        vTaskDelay(1)
     }
 
 }

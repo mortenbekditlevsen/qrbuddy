@@ -4,8 +4,6 @@
 #include "bsp_display.h"
 #include "particle.h"
 
-#define QR_PX_PER_MODULE 3
-#define QR_QUIET_MODULES 4   // spec-recommended quiet zone (white border) on every side
 #define QR_MAX_MODULES   qrcodegen_BUFFER_LEN_FOR_VERSION(40) // generous upper bound
 #define QR_VISIBLE_SECONDS 60  // how long the QR code stays on screen
 #define QR_BACKLIGHT     20    // backlight % while a QR code is on screen
@@ -16,12 +14,21 @@
 // `particle_buf`, then just draw whatever came back.
 #define PARTICLE_TICK_MS     50    // ~20 fps simulate + redraw
 #define PARTICLE_BACKLIGHT   100   // backlight % while a particle effect is showing
-#define PARTICLE_SATURATION  55    // fixed HSV S/V for every particle -- bright, near-white dots
-#define PARTICLE_VALUE       100
+#define PARTICLE_VALUE       100   // fixed HSV V for every particle -- per-particle sat/hue vary
 
 static uint8_t qr_buf[177][177]; // 177 = max modules at version 40
 static int qr_modules = 0;
-static bool qr_visible = false;        // whether draw_qr should paint anything
+static bool qr_visible = false;        // whether draw_qr should paint anything (the "real", BLE-triggered display)
+
+// Solid-QR overlay for the particle effect's QR case: once its particles
+// settle into the silhouette, Swift crossfades this in on top (reusing the
+// same draw_qr renderer, border and all) rather than trying to draw one
+// particle per module -- a real QR at our forced version has ~1650 dark
+// modules, far more than this hardware can redraw every tick. Independent of
+// qr_visible/the BLE-triggered display above; only one of the two is ever
+// non-zero-opacity at a time in practice, since they're driven by mutually
+// exclusive modes (see stop_particles()/rgb_tile_show_qr()).
+static uint8_t particle_qr_overlay_opa = 0;
 
 static lv_obj_t *obj_rgb_tile;
 static lv_obj_t *qr_countdown_label;   // "seconds left" label, hidden while no QR
@@ -62,13 +69,17 @@ static bool qr_generate(const char * text)
     return true;
 }
 
-static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords)
+/* Draws the fully-detailed, solid QR (border included) at `overlay_opa`
+ * (0 = skip entirely, 255 = fully opaque). Used both for the "real"
+ * BLE-triggered display (always LV_OPA_COVER) and, at a Swift-ramped partial
+ * opacity, as the particle effect's crossfade-in overlay. */
+static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords, lv_opa_t overlay_opa)
 {
-    if (!qr_visible || qr_modules <= 0) return;
+    if (overlay_opa == LV_OPA_TRANSP || qr_modules <= 0) return;
 
     int32_t obj_w = lv_area_get_width(obj_coords);
-    int32_t qr_px = qr_modules * QR_PX_PER_MODULE;
-    int32_t quiet_px = QR_QUIET_MODULES * QR_PX_PER_MODULE;
+    int32_t qr_px = qr_modules * QR_LAYOUT_PX_PER_MODULE;
+    int32_t quiet_px = QR_LAYOUT_QUIET_MODULES * QR_LAYOUT_PX_PER_MODULE;
 
     // Center horizontally; sit near the top so the countdown label has room below.
     int32_t origin_x = obj_coords->x1 + (obj_w - qr_px) / 2;
@@ -77,7 +88,7 @@ static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords)
     lv_draw_rect_dsc_t bg_dsc;
     lv_draw_rect_dsc_init(&bg_dsc);
     bg_dsc.bg_color = lv_color_white();
-    bg_dsc.bg_opa = LV_OPA_COVER;
+    bg_dsc.bg_opa = overlay_opa;
     // Round the corners, but no more than the quiet zone is wide so the rounding
     // stays in the white border and never clips a QR finder pattern.
     bg_dsc.radius = quiet_px;
@@ -95,7 +106,7 @@ static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords)
     lv_draw_rect_dsc_t dsc;
     lv_draw_rect_dsc_init(&dsc);
     dsc.bg_color = lv_color_black();
-    dsc.bg_opa = LV_OPA_COVER;
+    dsc.bg_opa = overlay_opa;
     dsc.radius = 0;
     dsc.border_width = 0;
 
@@ -109,10 +120,10 @@ static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords)
             int run_len = c - run_start;
 
             lv_area_t module_area;
-            module_area.x1 = origin_x + run_start * QR_PX_PER_MODULE;
-            module_area.y1 = origin_y + r * QR_PX_PER_MODULE;
-            module_area.x2 = module_area.x1 + run_len * QR_PX_PER_MODULE - 1;
-            module_area.y2 = module_area.y1 + QR_PX_PER_MODULE - 1;
+            module_area.x1 = origin_x + run_start * QR_LAYOUT_PX_PER_MODULE;
+            module_area.y1 = origin_y + r * QR_LAYOUT_PX_PER_MODULE;
+            module_area.x2 = module_area.x1 + run_len * QR_LAYOUT_PX_PER_MODULE - 1;
+            module_area.y2 = module_area.y1 + QR_LAYOUT_PX_PER_MODULE - 1;
 
             lv_draw_rect(layer, &dsc, &module_area);
         }
@@ -134,7 +145,7 @@ static void draw_particles(lv_layer_t *layer, const lv_area_t *obj_coords)
         const particle_t *p = &particle_buf[i];
         if (p->opa < 6) continue;  // ~0.02 alpha cutoff
 
-        dsc.bg_color = lv_color_hsv_to_rgb(p->hue, PARTICLE_SATURATION, PARTICLE_VALUE);
+        dsc.bg_color = lv_color_hsv_to_rgb(p->hue, p->sat, PARTICLE_VALUE);
         dsc.bg_opa = p->opa;
 
         int32_t s = p->size;
@@ -159,9 +170,14 @@ static void rgb_tile_draw_event_cb(lv_event_t * e)
     lv_obj_get_coords(obj, &obj_coords);
 
     if (qr_visible) {
-        draw_qr(layer, &obj_coords);
-    } else if (particles_active) {
-        draw_particles(layer, &obj_coords);
+        draw_qr(layer, &obj_coords, LV_OPA_COVER);
+    } else {
+        if (particles_active) {
+            draw_particles(layer, &obj_coords);
+        }
+        if (particle_qr_overlay_opa != 0) {
+            draw_qr(layer, &obj_coords, particle_qr_overlay_opa);
+        }
     }
 }
 
@@ -180,6 +196,7 @@ static void stop_particles(void)
 {
     if (particle_tick_timer) lv_timer_pause(particle_tick_timer);
     particles_active = false;
+    particle_qr_overlay_opa = 0;   // don't let a stale crossfade linger into the next activation
 }
 
 /* Take the QR code off screen: stop the countdown, blank the tile, backlight off. */
@@ -313,4 +330,23 @@ void rgb_tile_hide_particles(void)
         lv_obj_invalidate(obj_rgb_tile);
     }
     bsp_display_set_brightness(0);
+}
+
+/* (Re)generate the solid QR for the particle effect's crossfade overlay.
+ * Shares qr_buf/qr_modules with the "real" BLE-triggered display -- safe,
+ * since the two are mutually exclusive (only one of qr_visible / the
+ * particle effect is ever active) and each resets the other's leftovers when
+ * it takes over (see stop_qr()/stop_particles()). If encoding fails, the
+ * overlay just keeps showing whatever it last had. */
+void particle_qr_prepare(const char *text)
+{
+    qr_generate(text);
+}
+
+void particle_qr_set_overlay_opacity(uint8_t opa)
+{
+    // Called from within particle_effect_tick(), i.e. from inside
+    // particle_tick_cb() -- which already invalidates the tile once it
+    // regains control, so no need to do it again here.
+    particle_qr_overlay_opa = opa;
 }

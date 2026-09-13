@@ -11,8 +11,8 @@
 
 // Particle-effect simulation for the idle screen. rgb_tile.c (C/LVGL) owns
 // the tile, the timer, the backlight, and drawing -- it has no idea which
-// effect is running. This file owns the "what does the screen currently look
-// like" question entirely.
+// effect is running, or that morphing/physics exist at all. This file owns
+// everything about "what does the screen currently look like."
 //
 // Embedded Swift has no runtime type metadata, so a `protocol` +
 // `any ParticleEffect` existential (the usual way to make this pluggable)
@@ -22,38 +22,186 @@
 //   embedded Swift [#EmbeddedRestrictions]
 //
 // A closed enum stands in for that polymorphism instead. Adding a new effect
-// is: write a new struct with its own state + `tick`, add a case below, add
-// one arm to the switch in `particle_effect_tick`. No C changes.
+// is: write a new struct with its own state + `reset`/`targets`, add a case
+// below, add one arm to `tick(_:...)` and `springDampFor(_:)`. No C changes.
+//
+// Ported from particle_multishape_morph_3.html, with two deliberate
+// differences from the JS's own QR handling:
+//
+//   - Modules are still grouped into `min(darkModules, poolSize)`
+//     raster-adjacent clusters (one dot per cluster) rather than the JS's
+//     clone system (temporary particles spawned per module, later merged back
+//     into their parent) -- a real QR here has ~1650 dark modules at our
+//     forced version, far more than this hardware can redraw every tick, so
+//     "one dot per module" was never reachable regardless of implementation.
+//   - Instead, once the clustered particles settle into the silhouette, they
+//     crossfade into the real, fully-detailed, solid QR (rgb_tile.c's
+//     existing renderer, border and all -- see particle_qr_prepare() /
+//     particle_qr_set_overlay_opacity() and the crossfade state machine
+//     below), then crossfade back to particles before the effect moves on.
+//     This is also where the true white color comes from: it's the solid
+//     renderer's own black-on-white rendering, not a particle color.
+//
+// The particles themselves are desaturated too (`sat: 0` in their
+// SlotTarget), for a coherent look during the part of the transition where
+// they're still visibly particles.
+
+// MARK: - Physics-facing descriptor each effect produces per particle slot
+
+/// What a shape wants for one particle slot, this tick: where to pull it,
+/// how big/bright it should end up, and what hue. `teleport` bypasses the
+/// spring entirely for a hard discontinuity (Starfield's depth-wrap) -- see
+/// its use there for why chasing a teleport with a spring would look like a
+/// streak across the screen instead of a star recycling.
+private struct SlotTarget {
+    var x: Float = 0
+    var y: Float = 0
+    var size: Float = 3
+    var alpha: Float = 0
+    var hue: Float = 210
+    var sat: Float = 55   // 0-100 HSV saturation; QR uses 0 for a white look
+    var teleport = false
+}
+
+// MARK: - Effect selection
 
 enum CurrentParticleEffect {
     case starfield(Starfield)
     case sphere(Sphere)
-    // case flock(Flock), case qr(...), ... go here later
+    case cube(Cube)
+    case qr(String)   // the URL to encode; regenerated (cached) only when it changes
 }
 
 private var currentEffect: CurrentParticleEffect = .starfield(Starfield())
+private var previousEffect: CurrentParticleEffect?   // kept "alive" (still ticking) during a blend-out
 
-// TEST ONLY: cycle through effects every 5s so both are easy to see without
-// wiring up a real trigger yet (a BLE property, a button, ...). This ticks
+// TEST ONLY: cycle through effects every 5s so they're all easy to see
+// without wiring up a real trigger yet (a BLE property, a button, ...). This
 // counter is driven by the same timer as everything else, so `ticksPerEffect`
 // must track PARTICLE_TICK_MS in rgb_tile.c (currently 50 ms -> 20 Hz).
 // Remove this block once you've settled on how effects should actually switch.
 private let ticksPerEffect: Int32 = 5 * 20  // 5s * 20 Hz
 private var ticksUntilSwitch: Int32 = ticksPerEffect
+private let testURL = "https://ka-ching.dk"
 
-// Cross-effect morph: when switching, ease every particle slot from wherever
-// it last was (`lastOutputBuffer`) to the newly-selected effect's live output
-// for *this* tick, rather than snapping. Lives entirely at the dispatcher
-// level -- Starfield/Sphere/etc. only ever need to produce "where am I right
-// now", never anything morph-aware.
-private let morphDurationTicks = MorphEase.steps   // ~1.4s at 20 Hz
-private var morphElapsedTicks: Int32 = MorphEase.steps  // start "not morphing"
-private let scratchBuffer = UnsafeMutablePointer<particle_t>.allocate(capacity: Int(PARTICLE_MAX_COUNT))
-private let lastOutputBuffer = UnsafeMutablePointer<particle_t>.allocate(capacity: Int(PARTICLE_MAX_COUNT))
-private var lastOutputCount: Int32 = 0
+// Crossfade from the particle-formed QR silhouette to the real, fully-
+// detailed solid QR (rgb_tile.c's existing renderer) once the particles have
+// settled, and back again before the effect moves on. `.faded` (distinct
+// from `.none`) marks "finished fading out, just waiting for the scheduled
+// switch to actually leave .qr" -- without it, the very next tick would see
+// "still in .qr, blend already done" and immediately restart fadingIn.
+private enum QRCrossfade: Equatable {
+    case none
+    case fadingIn(Float)   // 0...1
+    case holding
+    case fadingOut(Float)  // 1...0
+    case faded
+}
+private var qrCrossfade: QRCrossfade = .none
+private let qrFadeDuration: Float = 0.5   // seconds
+private let qrFadeLeadTicks = Int32((0.5 / 0.05).rounded())  // start fading out this many ticks before the scheduled switch
 
-private func lerp(_ a: Int32, _ b: Int32, _ e1000: Int32) -> Int32 {
-    a + ((b - a) * e1000) / 1000
+// MARK: - Physics tuning (ported from the JS prototype's constants)
+
+private let tickDt: Float = 0.05           // PARTICLE_TICK_MS in rgb_tile.c, as seconds
+
+// The spring/damping constants below were tuned (in the JS prototype) against
+// ~60fps physics steps. Our LVGL timer only ticks at 20Hz, which is too
+// coarse a timestep for this stiffness to integrate stably (explicit-Euler
+// spring integrators want a small step relative to their natural frequency).
+// Sub-stepping the integration 3x per tick, at the original ~60fps step size,
+// reproduces the same per-step dynamics as the prototype instead of retuning
+// every constant for a coarser step.
+private let physicsSubsteps = 3
+private let substepDt: Float = 1.0 / 60.0
+
+private let staggerMax: Float = 0.35       // seconds; per-particle random delay before it responds to a new shape
+private let blendDuration: Float = 0.55    // seconds; force blends from old shape's pull to new shape's over this long
+private let fadeRate: Float = 1 - expf(-0.05 / 0.22)   // size/alpha follow their target with this time constant
+private let hueRate: Float = 1 - expf(-0.05 / 0.9)     // hue chases its target hue with this (slower) time constant
+
+// MARK: - Persistent per-particle physical state (dispatcher-owned; effects never see this)
+
+private struct Slot {
+    var x: Float = 0, y: Float = 0
+    var vx: Float = 0, vy: Float = 0
+    var dispSize: Float = 3
+    var dispAlpha: Float = 0
+    var dispSat: Float = 55
+    var hue: Float = 210
+    var staggerDelay: Float = 0
+}
+private var slots = [Slot](repeating: Slot(), count: Int(PARTICLE_MAX_COUNT))
+private var transitionElapsed: Float = 1000   // seconds since the last switch; large == "not blending"
+
+// A fixed permutation from persistent particle index -> target-array index,
+// applied uniformly no matter which shape generated the target array. Without
+// it, particle i always reads target i from every shape in turn, and since
+// shapes build targets in systematic order (raster, edge-by-edge, latitude
+// band), whole rows/edges would visibly sweep together on every switch
+// instead of scattering organically. Computed once at boot.
+private let particleOrder: [Int] = Array(0 ..< Int(PARTICLE_MAX_COUNT)).shuffled()
+
+private var scratchNew = [SlotTarget](repeating: SlotTarget(), count: Int(PARTICLE_MAX_COUNT))
+private var scratchOld = [SlotTarget](repeating: SlotTarget(), count: Int(PARTICLE_MAX_COUNT))
+
+private func smoothstep(_ t: Float) -> Float { t * t * (3 - 2 * t) }
+
+private func hueLerpShortestPath(_ h: Float, _ target: Float, _ rate: Float) -> Float {
+    var diff = (target - h).truncatingRemainder(dividingBy: 360)
+    if diff > 180 { diff -= 360 }
+    if diff < -180 { diff += 360 }
+    var result = (h + diff * rate).truncatingRemainder(dividingBy: 360)
+    if result < 0 { result += 360 }
+    return result
+}
+
+private func springDampFor(_ effect: CurrentParticleEffect) -> (k: Float, damping: Float) {
+    switch effect {
+    case .starfield: return (Starfield.springK, Starfield.damping)
+    case .sphere:    return (Sphere.springK, Sphere.damping)
+    case .cube:      return (Cube.springK, Cube.damping)
+    case .qr:        return (Sphere.springK, Sphere.damping)  // same "settle into formation" role as sphere/cube
+    }
+}
+
+/// Advances whichever effect this is (mutating its own per-tick state --
+/// Starfield's depth, Sphere/Cube's rotation angle) and fills `out` with its
+/// live targets for right now. Used for both the current and (while blending)
+/// the outgoing effect, so an outgoing sphere keeps rotating away instead of
+/// freezing the instant you switch off it.
+private func tick(_ effect: inout CurrentParticleEffect, tileW: Int32, tileH: Int32, into out: inout [SlotTarget]) -> Int32 {
+    switch effect {
+    case .starfield(var e):
+        let n = e.targets(tileW: tileW, tileH: tileH, into: &out)
+        effect = .starfield(e)
+        return n
+    case .sphere(var e):
+        let n = e.targets(tileW: tileW, tileH: tileH, into: &out)
+        effect = .sphere(e)
+        return n
+    case .cube(var e):
+        let n = e.targets(tileW: tileW, tileH: tileH, into: &out)
+        effect = .cube(e)
+        return n
+    case .qr(let url):
+        return qrTargets(url: url, tileW: tileW, tileH: tileH, into: &out)
+    }
+}
+
+/// Resets whichever effect `currentEffect` currently is, and (re)arms the
+/// per-particle stagger delays for a fresh transition.
+private func beginTransition(tileW: Int32, tileH: Int32) {
+    switch currentEffect {
+    case .starfield(var e): e.reset(tileW: tileW, tileH: tileH); currentEffect = .starfield(e)
+    case .sphere(var e):    e.reset(tileW: tileW, tileH: tileH); currentEffect = .sphere(e)
+    case .cube(var e):      e.reset(tileW: tileW, tileH: tileH); currentEffect = .cube(e)
+    case .qr:               break   // no reset needed -- qrTargets regenerates lazily from its own cache
+    }
+    for i in 0 ..< slots.count {
+        slots[i].staggerDelay = Float.random(in: 0...staggerMax)
+    }
+    transitionElapsed = 0
 }
 
 /// Called by rgb_tile.c's particle timer (~20 Hz) while a particle effect is
@@ -68,238 +216,270 @@ func particle_effect_tick(
     _ tileH: Int32,
     _ reset: Bool
 ) {
-    var needsReset = reset
+    if reset {
+        previousEffect = nil   // fresh activation: nothing to blend from
+        qrCrossfade = .none
+        particle_qr_set_overlay_opacity(0)
+        beginTransition(tileW: tileW, tileH: tileH)
+    }
 
-    ticksUntilSwitch -= 1
-    if ticksUntilSwitch <= 0 {
+    if ticksUntilSwitch > 0 { ticksUntilSwitch -= 1 }
+
+    // Don't leave .qr mid-crossfade -- wait for a full fade-out first (the
+    // .holding case below starts that fade-out on its own, early enough to
+    // finish before ticksUntilSwitch would otherwise force the issue).
+    let qrGateOpen: Bool = {
+        if case .qr = currentEffect { return qrCrossfade == .none || qrCrossfade == .faded }
+        return true
+    }()
+
+    if ticksUntilSwitch <= 0 && qrGateOpen {
         ticksUntilSwitch = ticksPerEffect
+        previousEffect = currentEffect
         switch currentEffect {
         case .starfield: currentEffect = .sphere(Sphere())
-        case .sphere:    currentEffect = .starfield(Starfield())
+        case .sphere:    currentEffect = .cube(Cube())
+        case .cube:      currentEffect = .qr(testURL)
+        case .qr:        currentEffect = .starfield(Starfield())
         }
-        needsReset = true
-        morphElapsedTicks = 0   // start easing from whatever's in lastOutputBuffer
+        qrCrossfade = .none
+        particle_qr_set_overlay_opacity(0)
+        beginTransition(tileW: tileW, tileH: tileH)
     }
 
-    // This tick's "live" target from whichever effect is now current -- always
-    // computed fresh, morphing or not, since e.g. Sphere keeps rotating and
-    // Starfield keeps flying *during* the transition too.
-    let scratch = UnsafeMutableBufferPointer(start: scratchBuffer, count: Int(capacity))
-    var liveCount: Int32 = 0
-    switch currentEffect {
-    case .starfield(var effect):
-        if needsReset { effect.reset(tileW: tileW, tileH: tileH) }
-        liveCount = effect.tick(tileW: tileW, tileH: tileH, into: scratch)
-        currentEffect = .starfield(effect)
-    case .sphere(var effect):
-        if needsReset { effect.reset(tileW: tileW, tileH: tileH) }
-        liveCount = effect.tick(tileW: tileW, tileH: tileH, into: scratch)
-        currentEffect = .sphere(effect)
+    let newCount = tick(&currentEffect, tileW: tileW, tileH: tileH, into: &scratchNew)
+    let (newK, newDamping) = springDampFor(currentEffect)
+
+    var oldCount: Int32 = 0
+    var oldK: Float = 0, oldDamping: Float = 0
+    let blending = previousEffect != nil
+    if blending {
+        (oldK, oldDamping) = springDampFor(previousEffect!)
+        var prev = previousEffect!
+        oldCount = tick(&prev, tileW: tileW, tileH: tileH, into: &scratchOld)
+        previousEffect = prev
     }
 
-    guard morphElapsedTicks < morphDurationTicks else {
-        // Not morphing: pass the live output straight through.
-        for i in 0 ..< Int(liveCount) {
-            particles[i] = scratch[i]
-            lastOutputBuffer[i] = scratch[i]
+    var written: Int32 = 0
+    for i in 0 ..< Int(capacity) {
+        let targetIdx = particleOrder[i]
+
+        let newT: SlotTarget = targetIdx < Int(newCount)
+            ? scratchNew[targetIdx]
+            : SlotTarget(x: slots[i].x, y: slots[i].y, size: slots[i].dispSize, alpha: 0, hue: slots[i].hue, sat: slots[i].dispSat)
+
+        var target = newT
+        var k = newK, damping = newDamping
+
+        if blending {
+            let localT = min(max((transitionElapsed - slots[i].staggerDelay) / blendDuration, 0), 1)
+            let ease = smoothstep(localT)
+            if ease < 1 {
+                let oldT: SlotTarget = targetIdx < Int(oldCount)
+                    ? scratchOld[targetIdx]
+                    : SlotTarget(x: slots[i].x, y: slots[i].y, size: slots[i].dispSize, alpha: 0, hue: slots[i].hue, sat: slots[i].dispSat)
+
+                target.x = oldT.x + (newT.x - oldT.x) * ease
+                target.y = oldT.y + (newT.y - oldT.y) * ease
+                target.size = oldT.size + (newT.size - oldT.size) * ease
+                target.alpha = oldT.alpha + (newT.alpha - oldT.alpha) * ease
+                target.sat = oldT.sat + (newT.sat - oldT.sat) * ease
+                target.teleport = newT.teleport || oldT.teleport
+                k = oldK + (newK - oldK) * ease
+                damping = oldDamping + (newDamping - oldDamping) * ease
+            }
         }
-        lastOutputCount = liveCount
-        outCount.pointee = liveCount
-        return
-    }
 
-    // Morphing: blend each slot from its last drawn value toward this tick's
-    // live target. A slot missing on one side (the old or new effect has
-    // fewer particles) fades in/out in place instead of popping.
-    let e1000 = MorphEase.progress(atTick: morphElapsedTicks)
-    let slotCount = min(max(liveCount, lastOutputCount), capacity)
-
-    for i in 0 ..< Int(slotCount) {
-        let hasStart = i < Int(lastOutputCount)
-        let hasTarget = i < Int(liveCount)
-
-        let target = hasTarget ? scratch[i]
-            : particle_t(sx: lastOutputBuffer[i].sx, sy: lastOutputBuffer[i].sy,
-                         size: lastOutputBuffer[i].size, hue: lastOutputBuffer[i].hue, opa: 0)
-        let start = hasStart ? lastOutputBuffer[i]
-            : particle_t(sx: target.sx, sy: target.sy, size: target.size, hue: target.hue, opa: 0)
-
-        let blended = particle_t(
-            sx: lerp(start.sx, target.sx, e1000),
-            sy: lerp(start.sy, target.sy, e1000),
-            size: lerp(start.size, target.size, e1000),
-            hue: MorphEase.hueLerp(start.hue, target.hue, e1000),
-            opa: UInt8(lerp(Int32(start.opa), Int32(target.opa), e1000))
-        )
-        particles[i] = blended
-        lastOutputBuffer[i] = blended
-    }
-    morphElapsedTicks += 1
-    lastOutputCount = slotCount
-    outCount.pointee = slotCount
-}
-
-/// Fixed-point (Q10, `scale` = 1000) easeInOutCubic, precomputed per tick
-/// index instead of computed per particle -- and shortest-path hue blending,
-/// matching the JS prototype's `hueLerp`. Shared by the dispatcher above.
-enum MorphEase {
-    static let steps: Int32 = 28   // ~1.4s at 20 Hz, matching the JS MORPH_DURATION
-
-    static let table: [Int32] = (0...Int(steps)).map { i in
-        let t = Float(i) / Float(steps)
-        let e: Float
-        if t < 0.5 {
-            e = 4 * t * t * t
+        if target.teleport {
+            // A hard discontinuity (e.g. Starfield recycling a star far away)
+            // -- snap straight there instead of springing across the screen.
+            slots[i].x = target.x
+            slots[i].y = target.y
+            slots[i].vx = 0
+            slots[i].vy = 0
+            slots[i].dispSize = target.size
+            slots[i].dispAlpha = target.alpha
+            slots[i].dispSat = target.sat
         } else {
-            let f = -2 * t + 2
-            e = 1 - (f * f * f) / 2
+            for _ in 0 ..< physicsSubsteps {
+                let fx = (target.x - slots[i].x) * k
+                let fy = (target.y - slots[i].y) * k
+                slots[i].vx += (fx - damping * slots[i].vx) * substepDt
+                slots[i].vy += (fy - damping * slots[i].vy) * substepDt
+                slots[i].x += slots[i].vx * substepDt
+                slots[i].y += slots[i].vy * substepDt
+            }
+            slots[i].dispSize += (target.size - slots[i].dispSize) * fadeRate
+            slots[i].dispAlpha += (target.alpha - slots[i].dispAlpha) * fadeRate
+            slots[i].dispSat += (target.sat - slots[i].dispSat) * fadeRate
         }
-        return Int32(e * 1000)
+
+        slots[i].hue = hueLerpShortestPath(slots[i].hue, target.hue, hueRate)
+
+        if slots[i].dispAlpha > 0.02, Int(written) < Int(capacity) {
+            let hue = slots[i].hue < 0 ? slots[i].hue + 360 : slots[i].hue
+            particles[Int(written)] = particle_t(
+                sx: Int32(slots[i].x.rounded()),
+                sy: Int32(slots[i].y.rounded()),
+                size: Int32(max(slots[i].dispSize, 1).rounded()),
+                hue: UInt16(hue),
+                sat: UInt8(min(max(slots[i].dispSat, 0), 100).rounded()),
+                opa: UInt8((min(max(slots[i].dispAlpha, 0), 1) * 255).rounded())
+            )
+            written += 1
+        }
     }
 
-    static func progress(atTick tick: Int32) -> Int32 {
-        var clamped = tick
-        if clamped < 0 { clamped = 0 }
-        if clamped > steps { clamped = steps }
-        return table[Int(clamped)]
+    if blending, transitionElapsed >= staggerMax + blendDuration {
+        previousEffect = nil
     }
+    transitionElapsed += tickDt
+    outCount.pointee = written
 
-    static func hueLerp(_ a: UInt16, _ b: UInt16, _ e1000: Int32) -> UInt16 {
-        let ai = Int32(a), bi = Int32(b)
-        let diff = ((bi - ai + 540) % 360) - 180   // shortest path around the wheel
-        let blended = ai + (diff * e1000) / 1000
-        return UInt16((blended % 360 + 360) % 360)
+    // Drive the QR crossfade: solidify into the real QR once the particles
+    // have settled into its silhouette, hold, then fade back to particles
+    // before the scheduled switch (gated above) actually leaves .qr.
+    if case .qr(let url) = currentEffect {
+        switch qrCrossfade {
+        case .none:
+            if !blending {
+                url.withCString { particle_qr_prepare($0) }
+                qrCrossfade = .fadingIn(0)
+            }
+        case .fadingIn(let t):
+            let nt = min(t + tickDt / qrFadeDuration, 1)
+            particle_qr_set_overlay_opacity(UInt8(nt * 255))
+            qrCrossfade = nt >= 1 ? .holding : .fadingIn(nt)
+        case .holding:
+            if ticksUntilSwitch <= qrFadeLeadTicks {
+                qrCrossfade = .fadingOut(1)
+            }
+        case .fadingOut(let t):
+            let nt = max(t - tickDt / qrFadeDuration, 0)
+            particle_qr_set_overlay_opacity(UInt8(nt * 255))
+            qrCrossfade = nt <= 0 ? .faded : .fadingOut(nt)
+        case .faded:
+            break   // waiting for the gated switch (above, next tick) to actually leave .qr
+        }
+    } else if qrCrossfade != .none {
+        qrCrossfade = .none
+        particle_qr_set_overlay_opacity(0)
     }
 }
+
+// MARK: - Shared rotation lookup
 
 /// Shared sine/cosine lookup table for effects that need per-tick rotation.
 /// No hardware FPU, so trig is precomputed once here (using libm -- fine for
 /// a one-time cost) instead of ever being called per-particle, per-frame.
-/// `steps` around the circle, fixed-point Q12 (`scale` represents 1.0).
+/// `steps` around the circle.
 enum TrigLUT {
     static let steps: Int32 = 256
-    static let scale: Int32 = 4096
     private static let twoPi: Float = 6.2831853
 
-    static let cosTable: [Int32] = (0 ..< Int(steps)).map { i in
-        Int32(cosf(Float(i) * twoPi / Float(steps)) * Float(scale))
-    }
-    static let sinTable: [Int32] = (0 ..< Int(steps)).map { i in
-        Int32(sinf(Float(i) * twoPi / Float(steps)) * Float(scale))
-    }
+    static let cosTable: [Float] = (0 ..< Int(steps)).map { i in cosf(Float(i) * twoPi / Float(steps)) }
+    static let sinTable: [Float] = (0 ..< Int(steps)).map { i in sinf(Float(i) * twoPi / Float(steps)) }
 
     private static func wrap(_ index: Int32) -> Int {
         Int(((index % steps) + steps) % steps)
     }
-    static func cos(_ index: Int32) -> Int32 { cosTable[wrap(index)] }
-    static func sin(_ index: Int32) -> Int32 { sinTable[wrap(index)] }
+    static func cos(_ index: Int32) -> Float { cosTable[wrap(index)] }
+    static func sin(_ index: Int32) -> Float { sinTable[wrap(index)] }
 }
 
-/// Ambient "starfield" particle effect -- pure integer math (Embedded Swift
-/// has no hardware FPU). Ported from particle_multishape_morph.html's
-/// starfield: depth `z` is scaled by `zScale` and stepped down each tick;
-/// screen position is one integer divide per particle, the same shape as the
-/// JS `x = CX + bx/z` projection.
+// MARK: - Starfield
+
+/// Ambient "starfield" particle effect. Depth `z` (0.02 ... 1.0) shrinks each
+/// tick; screen position is one divide per particle: `x = CX + bx/z`, same as
+/// the JS prototype. When a star passes the camera or drifts off-tile, it's
+/// respawned far away -- flagged `teleport` so the dispatcher snaps it there
+/// instead of springing across the screen as a visible streak.
 struct Starfield {
     static let count = 100
-    static let zScale: Int32 = 1000
-    static let zMin: Int32 = 20   // recycle threshold (matches the JS z <= 0.02)
-    static let zStep: Int32 = 24  // depth/tick -> ~2s per particle's "flight" at 20 fps
-    static let edgeMargin: Int32 = 60
+    static let springK: Float = 260
+    static let damping: Float = 30
+    static let zSpeedPerSecond: Float = 0.48
+    static let edgeMargin: Float = 60
 
     private struct Point {
-        var bx: Int32 = 0
-        var by: Int32 = 0
-        var z: Int32 = Starfield.zScale
-        var hue: UInt16 = 210
+        var bx: Float = 0
+        var by: Float = 0
+        var z: Float = 1
+        var hue: Float = 210
     }
-
     private var points: [Point]
 
     init() {
         points = Array(repeating: Point(), count: Starfield.count)
     }
 
-    private static func randomOffset(within halfRange: Int32) -> Int32 {
-        guard halfRange > 0 else { return 0 }
-        return Int32.random(in: -halfRange...halfRange)
-    }
-
-    private mutating func spawn(_ i: Int, tileW: Int32, tileH: Int32) {
-        // matches genStarfield()'s `(rand-0.5)*W*1.4`
-        let halfW = (tileW * 7) / 10
-        let halfH = (tileH * 7) / 10
-        points[i].bx = Starfield.randomOffset(within: halfW)
-        points[i].by = Starfield.randomOffset(within: halfH)
-        points[i].z = Starfield.zScale
-        points[i].hue = UInt16(200 + Int32.random(in: 0..<60))  // cool blue/cyan band
+    private mutating func spawn(_ i: Int, tileW: Float, tileH: Float) {
+        points[i].bx = Float.random(in: -(tileW * 0.7)...(tileW * 0.7))
+        points[i].by = Float.random(in: -(tileH * 0.7)...(tileH * 0.7))
+        points[i].z = 1
+        points[i].hue = 200 + Float.random(in: 0..<60)  // cool blue/cyan band
     }
 
     /// (Re)initialize every particle, staggering initial depth so they don't
     /// all recycle in lockstep the first time through.
     mutating func reset(tileW: Int32, tileH: Int32) {
+        let w = Float(tileW), h = Float(tileH)
         for i in 0 ..< points.count {
-            spawn(i, tileW: tileW, tileH: tileH)
-            points[i].z = Int32.random(in: Starfield.zMin..<Starfield.zScale)
+            spawn(i, tileW: w, tileH: h)
+            points[i].z = Float.random(in: 0.02...1)
         }
     }
 
-    private func project(_ p: Point, cx: Int32, cy: Int32) -> (x: Int32, y: Int32) {
-        (cx + (p.bx * Starfield.zScale) / p.z, cy + (p.by * Starfield.zScale) / p.z)
-    }
-
-    mutating func tick(tileW: Int32, tileH: Int32, into buffer: UnsafeMutableBufferPointer<particle_t>) -> Int32 {
-        let cx = tileW / 2
-        let cy = tileH / 2
-        var written: Int32 = 0
+    fileprivate mutating func targets(tileW: Int32, tileH: Int32, into out: inout [SlotTarget]) -> Int32 {
+        let w = Float(tileW), h = Float(tileH)
+        let cx = w / 2, cy = h / 2
 
         for i in 0 ..< points.count {
-            points[i].z -= Starfield.zStep
-            if points[i].z < 1 { points[i].z = 1 }  // guard the divide; the threshold below recycles first anyway
+            points[i].z -= tickDt * Starfield.zSpeedPerSecond
 
-            var (sx, sy) = project(points[i], cx: cx, cy: cy)
-            let offscreen = sx < -Starfield.edgeMargin || sx > tileW + Starfield.edgeMargin
-                         || sy < -Starfield.edgeMargin || sy > tileH + Starfield.edgeMargin
-            if points[i].z <= Starfield.zMin || offscreen {
-                spawn(i, tileW: tileW, tileH: tileH)
-                (sx, sy) = project(points[i], cx: cx, cy: cy)
+            var projX = cx + points[i].bx / points[i].z
+            var projY = cy + points[i].by / points[i].z
+            var teleport = false
+
+            if points[i].z <= 0.02
+                || projX < -Starfield.edgeMargin || projX > w + Starfield.edgeMargin
+                || projY < -Starfield.edgeMargin || projY > h + Starfield.edgeMargin {
+                spawn(i, tileW: w, tileH: h)
+                projX = cx + points[i].bx / points[i].z
+                projY = cy + points[i].by / points[i].z
+                teleport = true
             }
 
-            var size = 2 + ((Starfield.zScale - points[i].z) * 5) / Starfield.zScale
-            if size < 2 { size = 2 }
-            if size > 8 { size = 8 }
+            // Size/alpha floor raised well above the JS original (1px/~25%)
+            // so even the farthest stars stay clearly visible on this panel.
+            let size = min(max(2 + (1 - points[i].z) * 6, 2), 8)
+            let alpha = min(max(0.55 + (1 - points[i].z) * 0.45, 0), 1)
 
-            // Opacity floor kept high (~55%) -- even the farthest stars stay visible.
-            var opa = 140 + ((Starfield.zScale - points[i].z) * (255 - 140)) / Starfield.zScale
-            if opa < 0 { opa = 0 }
-            if opa > 255 { opa = 255 }
-
-            guard Int(written) < buffer.count else { break }
-            buffer[Int(written)] = particle_t(sx: sx, sy: sy, size: size, hue: points[i].hue, opa: UInt8(opa))
-            written += 1
+            out[i] = SlotTarget(x: projX, y: projY, size: size, alpha: alpha, hue: points[i].hue, teleport: teleport)
         }
-        return written
+        return Int32(points.count)
     }
 }
 
+// MARK: - Sphere
+
 /// Rotating sphere of points, Fibonacci-sphere sampled -- ported from
-/// genSphere()/liveTargetFor('sphere') in particle_multishape_morph.html.
-/// Per-particle base coordinates (bx, by, bz) are computed once in `reset`
-/// using libm (cosf/sinf/sqrtf) -- fine, since that's a one-time cost per
-/// activation, not per frame. The continuous per-tick rotation then uses only
-/// `TrigLUT` (integer lookups) and integer math, no floats in the hot path.
+/// genSphere()/liveTargetFor('sphere'). Per-particle base coordinates
+/// (bx, by, bz) are computed once in `reset` using libm (cosf/sinf/sqrtf) --
+/// fine, since that's a one-time cost per activation, not per frame. The
+/// continuous per-tick rotation then uses only `TrigLUT`.
 struct Sphere {
     static let count = 100
-    static let baseScale: Int32 = 1000   // fixed-point scale for bx/by/bz (represents -1.0...1.0)
-    static let angleStep: Int32 = 2      // TrigLUT steps/tick -> ~6.4s per full rotation at 20 fps
+    static let springK: Float = 90
+    static let damping: Float = 14
+    static let angleStep: Int32 = 2   // TrigLUT steps/tick -> ~6.4s per full rotation at 20 fps
 
     private struct Point {
-        var bx: Int32 = 0
-        var by: Int32 = 0
-        var bz: Int32 = 0
-        var hue: UInt16 = 210
+        var bx: Float = 0
+        var by: Float = 0
+        var bz: Float = 0
+        var hue: Float = 210
     }
-
     private var points: [Point]
     private var angleIndex: Int32 = 0
 
@@ -316,49 +496,224 @@ struct Sphere {
             let radiusAtY = sqrtf(max(0, 1 - yy * yy))
             let theta: Float = 2.399963 * Float(i)             // golden angle
 
-            points[i].bx = Int32(cosf(theta) * radiusAtY * Float(Sphere.baseScale))
-            points[i].by = Int32(yy * Float(Sphere.baseScale))
-            points[i].bz = Int32(sinf(theta) * radiusAtY * Float(Sphere.baseScale))
-            points[i].hue = UInt16(190 + Int32.random(in: 0..<40))
+            points[i].bx = cosf(theta) * radiusAtY
+            points[i].by = yy
+            points[i].bz = sinf(theta) * radiusAtY
+            points[i].hue = 190 + Float.random(in: 0..<40)
         }
         angleIndex = 0
     }
 
-    mutating func tick(tileW: Int32, tileH: Int32, into buffer: UnsafeMutableBufferPointer<particle_t>) -> Int32 {
-        let cx = tileW / 2
-        let cy = tileH / 2
-        let radius = min(tileW, tileH) * 3 / 8   // scales with whatever tile size we're given
+    fileprivate mutating func targets(tileW: Int32, tileH: Int32, into out: inout [SlotTarget]) -> Int32 {
+        let w = Float(tileW), h = Float(tileH)
+        let cx = w / 2, cy = h / 2
+        let radius = min(w, h) * 0.375
 
         let cosA = TrigLUT.cos(angleIndex)
         let sinA = TrigLUT.sin(angleIndex)
         angleIndex = (angleIndex + Sphere.angleStep) % TrigLUT.steps
 
-        var written: Int32 = 0
         for i in 0 ..< points.count {
-            guard Int(written) < buffer.count else { break }
+            let p = points[i]
+            let x = p.bx * cosA + p.bz * sinA
+            let z = -p.bx * sinA + p.bz * cosA
+            let depth = (z + 1) / 2   // 0 (far side) ... 1 (near side)
+
+            out[i] = SlotTarget(
+                x: cx + x * radius, y: cy + p.by * radius,
+                size: 1.5 + depth * 3, alpha: 0.35 + depth * 0.65,
+                hue: p.hue
+            )
+        }
+        return Int32(points.count)
+    }
+}
+
+// MARK: - Cube
+
+/// Rotating wireframe cube, points spread along its 12 edges -- ported from
+/// genCube()/liveTargetFor('cube'). Rotation around Y uses the shared
+/// TrigLUT; the fixed 3/4-view tilt is a single precomputed sin/cos pair
+/// (computed once, like the LUT, not per particle).
+struct Cube {
+    static let count = 96   // 12 edges * 8 points/edge -- divides evenly, unlike 100
+    static let springK: Float = 90
+    static let damping: Float = 14
+    static let angleStep: Int32 = 2
+    static let focal: Float = 260
+
+    private static let tiltCos: Float = cosf(0.5)   // fixed radians -- a nice 3/4 view of the cube
+    private static let tiltSin: Float = sinf(0.5)
+
+    private struct Point {
+        var bx: Float = 0
+        var by: Float = 0
+        var bz: Float = 0
+        var hue: Float = 40
+    }
+    private var points: [Point]
+    private var angleIndex: Int32 = 0
+
+    init() {
+        points = Array(repeating: Point(), count: Cube.count)
+    }
+
+    mutating func reset(tileW: Int32, tileH: Int32) {
+        let corners: [(Float, Float, Float)] = [
+            (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+            (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1),
+        ]
+        let edges: [(Int, Int)] = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+        let perEdge = Cube.count / edges.count
+        var idx = 0
+        for (a, b) in edges {
+            let ca = corners[a], cb = corners[b]
+            for k in 0 ..< perEdge {
+                let t = Float(k) / Float(perEdge - 1)
+                points[idx].bx = ca.0 + (cb.0 - ca.0) * t
+                points[idx].by = ca.1 + (cb.1 - ca.1) * t
+                points[idx].bz = ca.2 + (cb.2 - ca.2) * t
+                points[idx].hue = 30 + Float.random(in: 0..<30)
+                idx += 1
+            }
+        }
+        angleIndex = 0
+    }
+
+    fileprivate mutating func targets(tileW: Int32, tileH: Int32, into out: inout [SlotTarget]) -> Int32 {
+        let w = Float(tileW), h = Float(tileH)
+        let cx = w / 2, cy = h / 2
+        let radius = min(w, h) * 0.3
+
+        let cosA = TrigLUT.cos(angleIndex)
+        let sinA = TrigLUT.sin(angleIndex)
+        angleIndex = (angleIndex + Cube.angleStep) % TrigLUT.steps
+
+        for i in 0 ..< points.count {
             let p = points[i]
 
-            // Rigid rotation around Y -- bx/bz mix, by is untouched.
-            let x1 = (p.bx * cosA + p.bz * sinA) / TrigLUT.scale
-            let z1 = (-p.bx * sinA + p.bz * cosA) / TrigLUT.scale
+            // Spin around Y, then a fixed tilt around X -- both rigid
+            // rotations, so every edge stays the same length.
+            let x1 = p.bx * cosA + p.bz * sinA
+            let z1 = -p.bx * sinA + p.bz * cosA
+            let y1 = p.by
 
-            var depth = (z1 + Sphere.baseScale) / 2   // 0 (far side) ... baseScale (near side)
-            if depth < 0 { depth = 0 }
-            if depth > Sphere.baseScale { depth = Sphere.baseScale }
+            let y2 = y1 * Cube.tiltCos - z1 * Cube.tiltSin
+            let z2 = y1 * Cube.tiltSin + z1 * Cube.tiltCos
 
-            let sx = cx + (x1 * radius) / Sphere.baseScale
-            let sy = cy + (p.by * radius) / Sphere.baseScale
+            // Perspective divide: points further from the camera shrink.
+            let worldZ = z2 * radius
+            let scale = Cube.focal / (Cube.focal + worldZ + radius)
 
-            var size = (1500 + depth * 3 + 500) / 1000   // ~1.5...4.5px, rounded
-            if size < 1 { size = 1 }
-
-            var opa = 89 + (depth * 166) / 1000          // ~35%...100%
-            if opa < 0 { opa = 0 }
-            if opa > 255 { opa = 255 }
-
-            buffer[Int(written)] = particle_t(sx: sx, sy: sy, size: size, hue: p.hue, opa: UInt8(opa))
-            written += 1
+            out[i] = SlotTarget(
+                x: cx + x1 * radius * scale, y: cy + y2 * radius * scale,
+                size: min(max(2.5 * scale, 1), 6),
+                alpha: min(max(0.25 + scale * 0.55, 0.15), 1),
+                hue: p.hue
+            )
         }
-        return written
+        return Int32(points.count)
     }
+}
+
+// MARK: - QR (particle silhouette, not the scannable renderer)
+
+/// Cached QR module layout for whichever URL is currently requested -- only
+/// regenerated when the URL string actually changes, since encoding runs
+/// qrcodegen (not free) while a plain lookup is essentially free.
+private struct QRCache {
+    var urlBytes: [UInt8]   // compared as raw UTF-8 bytes, not `String ==` -- see below
+    var targets: [SlotTarget]
+}
+private var qrCache: QRCache?
+
+private func qrTargets(url: String, tileW: Int32, tileH: Int32, into out: inout [SlotTarget]) -> Int32 {
+    // `String ==` on this target pulls in Unicode normalization tables
+    // (NFC/NFD) that aren't linked into this Embedded Swift build --
+    // `undefined reference to _swift_stdlib_getNormData` and friends.
+    // A raw UTF-8 byte comparison needs none of that and is exactly what
+    // "did the URL text change" actually requires here.
+    let urlBytes = Array(url.utf8)
+    if qrCache?.urlBytes != urlBytes {
+        qrCache = QRCache(urlBytes: urlBytes, targets: generateQRSlotTargets(url: url, tileW: tileW, tileH: tileH))
+    }
+    guard let cache = qrCache else { return 0 }
+    let n = min(cache.targets.count, out.count)
+    for i in 0 ..< n { out[i] = cache.targets[i] }
+    return Int32(n)
+}
+
+/// Encodes `url` (version locked to 10, matching rgb_tile.c's solid QR
+/// renderer) and maps its dark modules onto at most PARTICLE_MAX_COUNT slots.
+/// When there are more dark modules than slots, raster-adjacent modules are
+/// grouped into contiguous clusters and each cluster becomes one dot sized to
+/// roughly cover its group -- see the file-level note on why this replaces
+/// the JS prototype's clone/merge system.
+private func generateQRSlotTargets(url: String, tileW: Int32, tileH: Int32) -> [SlotTarget] {
+    let bufferLen = 408  // qrcodegen_BUFFER_LEN_FOR_VERSION(10), computed by hand: ((10*4+17)^2+7)/8+1
+    var qrcode = [UInt8](repeating: 0, count: bufferLen)
+    var tempBuffer = [UInt8](repeating: 0, count: bufferLen)
+
+    let ok: Bool = url.withCString { text in
+        qrcode.withUnsafeMutableBufferPointer { qrBuf in
+            tempBuffer.withUnsafeMutableBufferPointer { tmpBuf in
+                qrcodegen_encodeText(
+                    text, tmpBuf.baseAddress, qrBuf.baseAddress,
+                    qrcodegen_Ecc_MEDIUM, 10, 10, qrcodegen_Mask_AUTO, true
+                )
+            }
+        }
+    }
+    guard ok else { return [] }
+
+    var modules = 0
+    var darkCells: [(x: Int, y: Int)] = []
+    qrcode.withUnsafeBufferPointer { qrBuf in
+        modules = Int(qrcodegen_getSize(qrBuf.baseAddress))
+        guard modules > 0 else { return }
+        for y in 0 ..< modules {
+            for x in 0 ..< modules {
+                if qrcodegen_getModule(qrBuf.baseAddress, Int32(x), Int32(y)) {
+                    darkCells.append((x, y))
+                }
+            }
+        }
+    }
+    guard modules > 0, !darkCells.isEmpty else { return [] }
+
+    let poolSize = min(darkCells.count, Int(PARTICLE_MAX_COUNT))
+
+    // Same layout as rgb_tile.c's draw_qr (shared constants in particle.h) so
+    // the particle silhouette lines up with the solid QR it crossfades into.
+    let cellPx = Float(QR_LAYOUT_PX_PER_MODULE)
+    let qrPx = Float(modules) * cellPx
+    let quietPx = Float(QR_LAYOUT_QUIET_MODULES) * cellPx
+    let originX = (Float(tileW) - qrPx) / 2
+    let originY = quietPx + 20
+
+    var result: [SlotTarget] = []
+    result.reserveCapacity(poolSize)
+    for slot in 0 ..< poolSize {
+        let start = slot * darkCells.count / poolSize
+        let end = max((slot + 1) * darkCells.count / poolSize, start + 1)
+        var sumX: Float = 0, sumY: Float = 0
+        for k in start ..< end {
+            sumX += Float(darkCells[k].x)
+            sumY += Float(darkCells[k].y)
+        }
+        let n = Float(end - start)
+        result.append(SlotTarget(
+            x: originX + (sumX / n + 0.5) * cellPx,
+            y: originY + (sumY / n + 0.5) * cellPx,
+            size: cellPx * 1.1,
+            alpha: 1,
+            hue: 0,
+            sat: 0   // white, to match the solid QR it crossfades into
+        ))
+    }
+    return result
 }

@@ -3,7 +3,7 @@ idf_component_register(
     SRCS /dev/null # We don't have any C++ sources
     PRIV_INCLUDE_DIRS "."
     LDFRAGMENTS "linker.lf"
-    REQUIRES bt driver lvgl_ui
+    REQUIRES bt driver lvgl_ui qrcodegen
 )
 
 

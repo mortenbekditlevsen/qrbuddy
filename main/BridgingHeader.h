@@ -37,6 +37,7 @@
 
 #include "initialize.h"
 #include "tileview/particle.h"
+#include "qrcodegen.h"
 
 #ifndef MYNEWT_VAL_BLE_LL_WHITELIST_SIZE
 #define MYNEWT_VAL_BLE_LL_WHITELIST_SIZE CONFIG_BT_NIMBLE_WHITELIST_SIZE
