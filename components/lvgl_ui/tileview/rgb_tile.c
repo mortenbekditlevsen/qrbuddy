@@ -23,7 +23,7 @@ static bool qr_visible = false;        // whether draw_qr should paint anything 
 // Solid-QR overlay for the particle effect's QR case: once its particles
 // settle into the silhouette, Swift crossfades this in on top (reusing the
 // same draw_qr renderer, border and all) rather than trying to draw one
-// particle per module -- a real QR at our forced version has ~1650 dark
+// particle per module -- a real QR at our forced version has ~850 dark
 // modules, far more than this hardware can redraw every tick. Independent of
 // qr_visible/the BLE-triggered display above; only one of the two is ever
 // non-zero-opacity at a time in practice, since they're driven by mutually
@@ -44,17 +44,18 @@ static int32_t particle_tile_w = 280, particle_tile_h = 240; // set from the rea
 
 static bool qr_generate(const char * text)
 {
-    uint8_t qrcode[qrcodegen_BUFFER_LEN_FOR_VERSION(10)];
-    uint8_t tempBuffer[qrcodegen_BUFFER_LEN_FOR_VERSION(10)];
+    uint8_t qrcode[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
+    uint8_t tempBuffer[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
 
-    // Forcing version 10 keeps it at 57x57 to match what we've been drawing.
-    // "https://ka-ching.dk" easily fits at version 10 with room to spare.
+    // Forcing version 6 keeps it at 41x41 (QR_LAYOUT_MODULES) to match what
+    // we've been drawing -- see particle.h for why 6/5px/3-module-quiet is
+    // the combination that actually fits this display.
     bool ok = qrcodegen_encodeText(
         text,
         tempBuffer,
         qrcode,
         qrcodegen_Ecc_MEDIUM,
-        10, 10,                 // minVersion, maxVersion — locked to 57x57
+        6, 6,                   // minVersion, maxVersion — locked to 41x41
         qrcodegen_Mask_AUTO,
         true);
 
@@ -78,12 +79,19 @@ static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords, lv_opa_t ove
     if (overlay_opa == LV_OPA_TRANSP || qr_modules <= 0) return;
 
     int32_t obj_w = lv_area_get_width(obj_coords);
+    int32_t obj_h = lv_area_get_height(obj_coords);
     int32_t qr_px = qr_modules * QR_LAYOUT_PX_PER_MODULE;
     int32_t quiet_px = QR_LAYOUT_QUIET_MODULES * QR_LAYOUT_PX_PER_MODULE;
 
-    // Center horizontally; sit near the top so the countdown label has room below.
+    // Center both ways. (Previously top-aligned with a fixed +20 offset to
+    // leave room for the countdown label below -- but that offset is *in
+    // addition to* the code+quiet-zone block's own height, not part of a
+    // fixed budget, so at this larger module size it pushed the block's
+    // bottom edge 14px past the tile. Centering is self-adjusting and
+    // doesn't silently clip if the block is ever this close to tile size
+    // again -- though see the caller for the countdown label consequence.)
     int32_t origin_x = obj_coords->x1 + (obj_w - qr_px) / 2;
-    int32_t origin_y = obj_coords->y1 + quiet_px + 20;
+    int32_t origin_y = obj_coords->y1 + (obj_h - qr_px) / 2;
 
     lv_draw_rect_dsc_t bg_dsc;
     lv_draw_rect_dsc_init(&bg_dsc);
@@ -349,4 +357,14 @@ void particle_qr_set_overlay_opacity(uint8_t opa)
     // particle_tick_cb() -- which already invalidates the tile once it
     // regains control, so no need to do it again here.
     particle_qr_overlay_opa = opa;
+
+    // Ride the backlight down to QR-presentation brightness in step with the
+    // solid QR fading in over the particles, and back up to full as it fades
+    // back out -- driven by the same opacity Swift is already ramping tick by
+    // tick (see qrCrossfade in ParticleEffects.swift), so the brightness
+    // change tracks the visual crossfade exactly instead of needing its own
+    // timer. opa 0 (pure particles) -> PARTICLE_BACKLIGHT; opa 255 (fully
+    // solid QR) -> QR_BACKLIGHT.
+    int brightness = PARTICLE_BACKLIGHT - (PARTICLE_BACKLIGHT - QR_BACKLIGHT) * opa / 255;
+    bsp_display_set_brightness(brightness);
 }

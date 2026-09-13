@@ -28,21 +28,32 @@
 // Ported from particle_multishape_morph_3.html, with two deliberate
 // differences from the JS's own QR handling:
 //
-//   - Modules are still grouped into `min(darkModules, poolSize)`
-//     raster-adjacent clusters (one dot per cluster) rather than the JS's
-//     clone system (temporary particles spawned per module, later merged back
-//     into their parent) -- a real QR here has ~1650 dark modules at our
-//     forced version, far more than this hardware can redraw every tick, so
-//     "one dot per module" was never reachable regardless of implementation.
-//   - Instead, once the clustered particles settle into the silhouette, they
-//     crossfade into the real, fully-detailed, solid QR (rgb_tile.c's
-//     existing renderer, border and all -- see particle_qr_prepare() /
-//     particle_qr_set_overlay_opacity() and the crossfade state machine
-//     below), then crossfade back to particles before the effect moves on.
-//     This is also where the true white color comes from: it's the solid
-//     renderer's own black-on-white rendering, not a particle color.
+//   - Rather than the JS's clone system (temporary particles spawned per
+//     module, later merged back into their parent) or clustering the whole
+//     ~836-light-module field, particles target only the QR's recognizable
+//     "landmarks". Each position (finder) pattern gets two concentric,
+//     unfilled square outlines (qrFinderInnerRingLocal + squareRingPoints):
+//     its own real inner white ring, plus a second, synthetic ring drawn
+//     just past the black border -- roughly where the real separator sits
+//     -- together reading as a bold corner marker, rather than a filled
+//     blob or a faithful trace of the standard's own (fiddlier,
+//     corner-asymmetric) separator shape. The alignment pattern keeps its
+//     light ring as individual dots (qrAlignmentModules) -- small and
+//     interior, not a corner the way the finder patterns are. All of this is
+//     fixed by the standard for a given version, independent of content, so
+//     it's hardcoded rather than recomputed per URL -- and few enough
+//     (~100 points total) that there's no clustering to do at all.
+//   - Once the skeleton has (nearly) settled, particles crossfade into the
+//     real, fully-detailed, solid QR (rgb_tile.c's existing renderer, border
+//     and all -- see particle_qr_prepare() / particle_qr_set_overlay_opacity()
+//     and the crossfade state machine below), which is also where the actual
+//     data modules and the true white color come from: it's the solid
+//     renderer's own black-on-white rendering, not a particle color. The
+//     crossfade starts a little before the skeleton fully settles (see
+//     qrEarlyFadeLead) so the two overlap instead of a dead pause between
+//     "particles stop moving" and "solid QR appears".
 //
-// The particles themselves are desaturated too (`sat: 0` in their
+// The skeleton particles themselves are desaturated too (`sat: 0` in their
 // SlotTarget), for a coherent look during the part of the transition where
 // they're still visibly particles.
 
@@ -100,6 +111,7 @@ private enum QRCrossfade: Equatable {
 private var qrCrossfade: QRCrossfade = .none
 private let qrFadeDuration: Float = 0.5   // seconds
 private let qrFadeLeadTicks = Int32((0.5 / 0.05).rounded())  // start fading out this many ticks before the scheduled switch
+private let qrEarlyFadeLead: Float = 0.25  // start solidifying this long before the skeleton would otherwise finish settling
 
 // MARK: - Physics tuning (ported from the JS prototype's constants)
 
@@ -184,9 +196,33 @@ private func tick(_ effect: inout CurrentParticleEffect, tileW: Int32, tileH: In
         let n = e.targets(tileW: tileW, tileH: tileH, into: &out)
         effect = .cube(e)
         return n
-    case .qr(let url):
-        return qrTargets(url: url, tileW: tileW, tileH: tileH, into: &out)
+    case .qr:
+        return qrTargets(tileW: tileW, tileH: tileH, into: &out)
     }
+}
+
+/// The fallback target for a slot that the *active* shape on one side of a
+/// blend simply has no target for -- e.g. QR's skeleton (152 points) uses
+/// slots that Cube (96) or Starfield/Sphere (100) never touch. Placed on a
+/// ring safely outside the tile (not "wherever the slot's own last position
+/// happens to be" -- the previous approach), so:
+///   - entering an effect that needs a previously-idle slot, the blend reads
+///     this as the *old* target -- the particle flies in from off-screen.
+///   - leaving an effect that needed a slot the next one doesn't, this is
+///     the *new* target -- the particle flies back out, instead of just
+///     fading in place at its last on-screen spot.
+/// Fixed per slot index (not random per call) so an idle particle settles at
+/// one resting point rather than drifting every tick.
+private func parkedTarget(_ i: Int, tileW: Int32, tileH: Int32) -> SlotTarget {
+    let w = Float(tileW), h = Float(tileH)
+    let cx = w / 2, cy = h / 2
+    let radius = max(w, h)   // comfortably past every edge, whatever the tile's aspect ratio
+    let angleIdx = Int32((i * 41) % Int(TrigLUT.steps))   // spread idle particles around, not lockstep
+    return SlotTarget(
+        x: cx + TrigLUT.cos(angleIdx) * radius,
+        y: cy + TrigLUT.sin(angleIdx) * radius,
+        alpha: 0
+    )
 }
 
 /// Resets whichever effect `currentEffect` currently is, and (re)arms the
@@ -266,7 +302,7 @@ func particle_effect_tick(
 
         let newT: SlotTarget = targetIdx < Int(newCount)
             ? scratchNew[targetIdx]
-            : SlotTarget(x: slots[i].x, y: slots[i].y, size: slots[i].dispSize, alpha: 0, hue: slots[i].hue, sat: slots[i].dispSat)
+            : parkedTarget(i, tileW: tileW, tileH: tileH)
 
         var target = newT
         var k = newK, damping = newDamping
@@ -277,7 +313,7 @@ func particle_effect_tick(
             if ease < 1 {
                 let oldT: SlotTarget = targetIdx < Int(oldCount)
                     ? scratchOld[targetIdx]
-                    : SlotTarget(x: slots[i].x, y: slots[i].y, size: slots[i].dispSize, alpha: 0, hue: slots[i].hue, sat: slots[i].dispSat)
+                    : parkedTarget(i, tileW: tileW, tileH: tileH)
 
                 target.x = oldT.x + (newT.x - oldT.x) * ease
                 target.y = oldT.y + (newT.y - oldT.y) * ease
@@ -342,7 +378,11 @@ func particle_effect_tick(
     if case .qr(let url) = currentEffect {
         switch qrCrossfade {
         case .none:
-            if !blending {
+            // Start solidifying a little before the skeleton would otherwise
+            // finish settling (rather than waiting for `!blending`), so the
+            // tail of the particle motion and the start of the crossfade
+            // overlap instead of a dead pause in between.
+            if transitionElapsed >= (staggerMax + blendDuration) - qrEarlyFadeLead {
                 url.withCString { particle_qr_prepare($0) }
                 qrCrossfade = .fadingIn(0)
             }
@@ -622,98 +662,128 @@ struct Cube {
 
 // MARK: - QR (particle silhouette, not the scannable renderer)
 
-/// Cached QR module layout for whichever URL is currently requested -- only
-/// regenerated when the URL string actually changes, since encoding runs
-/// qrcodegen (not free) while a plain lookup is essentially free.
-private struct QRCache {
-    var urlBytes: [UInt8]   // compared as raw UTF-8 bytes, not `String ==` -- see below
-    var targets: [SlotTarget]
+/// Each position (finder) pattern gets TWO concentric, unfilled square
+/// outlines, not a filled blob:
+///   - The real inner white ring -- the standard finder pattern's own
+///     built-in 5x5 light ring (between its 7x7 dark border and 3x3 dark
+///     center). 16 modules, same relative shape at every corner, so it's a
+///     single local (corner-relative) list applied with each corner's offset.
+///   - A second, synthetic outer ring drawn just past the 7x7's black
+///     border (see qrOuterRingMargin), roughly where the real separator
+///     sits, so the two rings together read as concentric squares framing a
+///     bold corner marker -- rather than trying to match the standard's own
+///     (corner-asymmetric) separator shape exactly.
+/// (corner.x, corner.y) is each finder pattern's own top-left corner (the
+/// pure 7x7, not including the separator) -- for version 6 (41x41, locked in
+/// particle.h) that's (0,0), (34,0), (0,34).
+private let qrFinderCorners: [(x: Float, y: Float)] = [
+    (0, 0), (Float(QR_LAYOUT_MODULES) - 7, 0), (0, Float(QR_LAYOUT_MODULES) - 7),
+]
+private let qrFinderInnerRingLocal: [(x: Float, y: Float)] = [
+    (1, 1), (2, 1), (3, 1), (4, 1), (5, 1),
+    (1, 2), (5, 2),
+    (1, 3), (5, 3),
+    (1, 4), (5, 4),
+    (1, 5), (2, 5), (3, 5), (4, 5), (5, 5),
+]
+private let qrFinderHalfWidth: Float = 3.5        // pure 7x7 finder pattern, half-width in modules
+private let qrOuterRingMargin: Float = 1          // just past the black 7x7 border -- roughly the separator's own width
+private let qrOuterRingHalfSize: Float = qrFinderHalfWidth + qrOuterRingMargin
+// 8 points/side: at this ring's radius (halfSize 4.5 modules) that's ~5.6px
+// between points, just under the 5.5px dot size (cellPx * 1.1) -- dots
+// touch almost exactly, reading as a solid outline instead of dashes.
+private let qrOuterRingPointsPerSide = 8
+
+/// The alignment pattern's light ring, left as individual dots rather than
+/// squared off like the finder patterns -- it's a small, interior landmark,
+/// not a corner the way the finder patterns (and their quiet-zone bleed)
+/// are. Module coordinates, extracted once for version 6 the same way the
+/// finder skeleton was (content-independent function pattern, not data --
+/// see git history for the verification).
+private let qrAlignmentModules: [(x: Int32, y: Int32)] = [
+    (33, 33), (34, 33), (35, 33), (33, 34), (35, 34), (33, 35), (34, 35), (35, 35),
+]
+
+/// Evenly spaced points around a square's perimeter, walking clockwise from
+/// the top-left corner -- `pointsPerSide` per edge, no corner counted twice.
+/// Continuous module-coordinate space (not module indices), since this ring
+/// is a decorative shape, not real QR data.
+private func squareRingPoints(centerX: Float, centerY: Float, halfSize: Float, pointsPerSide: Int) -> [(x: Float, y: Float)] {
+    let n = Float(pointsPerSide)
+    let span = 2 * halfSize
+    var points: [(x: Float, y: Float)] = []
+    points.reserveCapacity(pointsPerSide * 4)
+    for i in 0 ..< pointsPerSide {
+        let t = Float(i) / n
+        points.append((centerX - halfSize + t * span, centerY - halfSize))   // top, left -> right
+    }
+    for i in 0 ..< pointsPerSide {
+        let t = Float(i) / n
+        points.append((centerX + halfSize, centerY - halfSize + t * span))   // right, top -> bottom
+    }
+    for i in 0 ..< pointsPerSide {
+        let t = Float(i) / n
+        points.append((centerX + halfSize - t * span, centerY + halfSize))   // bottom, right -> left
+    }
+    for i in 0 ..< pointsPerSide {
+        let t = Float(i) / n
+        points.append((centerX - halfSize, centerY + halfSize - t * span))   // left, bottom -> top
+    }
+    return points
 }
-private var qrCache: QRCache?
 
-private func qrTargets(url: String, tileW: Int32, tileH: Int32, into out: inout [SlotTarget]) -> Int32 {
-    // `String ==` on this target pulls in Unicode normalization tables
-    // (NFC/NFD) that aren't linked into this Embedded Swift build --
-    // `undefined reference to _swift_stdlib_getNormData` and friends.
-    // A raw UTF-8 byte comparison needs none of that and is exactly what
-    // "did the URL text change" actually requires here.
-    let urlBytes = Array(url.utf8)
-    if qrCache?.urlBytes != urlBytes {
-        qrCache = QRCache(urlBytes: urlBytes, targets: generateQRSlotTargets(url: url, tileW: tileW, tileH: tileH))
-    }
-    guard let cache = qrCache else { return 0 }
-    let n = min(cache.targets.count, out.count)
-    for i in 0 ..< n { out[i] = cache.targets[i] }
-    return Int32(n)
-}
-
-/// Encodes `url` (version locked to 10, matching rgb_tile.c's solid QR
-/// renderer) and maps its dark modules onto at most PARTICLE_MAX_COUNT slots.
-/// When there are more dark modules than slots, raster-adjacent modules are
-/// grouped into contiguous clusters and each cluster becomes one dot sized to
-/// roughly cover its group -- see the file-level note on why this replaces
-/// the JS prototype's clone/merge system.
-private func generateQRSlotTargets(url: String, tileW: Int32, tileH: Int32) -> [SlotTarget] {
-    let bufferLen = 408  // qrcodegen_BUFFER_LEN_FOR_VERSION(10), computed by hand: ((10*4+17)^2+7)/8+1
-    var qrcode = [UInt8](repeating: 0, count: bufferLen)
-    var tempBuffer = [UInt8](repeating: 0, count: bufferLen)
-
-    let ok: Bool = url.withCString { text in
-        qrcode.withUnsafeMutableBufferPointer { qrBuf in
-            tempBuffer.withUnsafeMutableBufferPointer { tmpBuf in
-                qrcodegen_encodeText(
-                    text, tmpBuf.baseAddress, qrBuf.baseAddress,
-                    qrcodegen_Ecc_MEDIUM, 10, 10, qrcodegen_Mask_AUTO, true
-                )
-            }
-        }
-    }
-    guard ok else { return [] }
-
-    var modules = 0
-    var darkCells: [(x: Int, y: Int)] = []
-    qrcode.withUnsafeBufferPointer { qrBuf in
-        modules = Int(qrcodegen_getSize(qrBuf.baseAddress))
-        guard modules > 0 else { return }
-        for y in 0 ..< modules {
-            for x in 0 ..< modules {
-                if qrcodegen_getModule(qrBuf.baseAddress, Int32(x), Int32(y)) {
-                    darkCells.append((x, y))
-                }
-            }
-        }
-    }
-    guard modules > 0, !darkCells.isEmpty else { return [] }
-
-    let poolSize = min(darkCells.count, Int(PARTICLE_MAX_COUNT))
-
-    // Same layout as rgb_tile.c's draw_qr (shared constants in particle.h) so
-    // the particle silhouette lines up with the solid QR it crossfades into.
+/// Maps the fixed finder rings + alignment dots into pixel-space
+/// SlotTargets. Same layout as rgb_tile.c's draw_qr (shared constants in
+/// particle.h) so the particle silhouette lines up with the solid QR it
+/// crossfades into. Doesn't touch qrcodegen at all -- everything here is
+/// content-independent, so there's nothing to encode until the actual
+/// crossfade (particle_qr_prepare(), driven separately once this settles).
+private func qrTargets(tileW: Int32, tileH: Int32, into out: inout [SlotTarget]) -> Int32 {
     let cellPx = Float(QR_LAYOUT_PX_PER_MODULE)
-    let qrPx = Float(modules) * cellPx
-    let quietPx = Float(QR_LAYOUT_QUIET_MODULES) * cellPx
+    let qrPx = Float(QR_LAYOUT_MODULES) * cellPx
     let originX = (Float(tileW) - qrPx) / 2
-    let originY = quietPx + 20
+    let originY = (Float(tileH) - qrPx) / 2
+    let dotSize = cellPx * 1.1
 
-    var result: [SlotTarget] = []
-    result.reserveCapacity(poolSize)
-    for slot in 0 ..< poolSize {
-        let start = slot * darkCells.count / poolSize
-        let end = max((slot + 1) * darkCells.count / poolSize, start + 1)
-        var sumX: Float = 0, sumY: Float = 0
-        for k in start ..< end {
-            sumX += Float(darkCells[k].x)
-            sumY += Float(darkCells[k].y)
+    var written = 0
+
+    for corner in qrFinderCorners {
+        // Real inner white ring -- module indices, so +0.5 to each cell's center.
+        for local in qrFinderInnerRingLocal {
+            guard written < out.count else { return Int32(written) }
+            out[written] = SlotTarget(
+                x: originX + (corner.x + local.x + 0.5) * cellPx,
+                y: originY + (corner.y + local.y + 0.5) * cellPx,
+                size: dotSize, alpha: 1, hue: 0, sat: 0
+            )
+            written += 1
         }
-        let n = Float(end - start)
-        result.append(SlotTarget(
-            x: originX + (sumX / n + 0.5) * cellPx,
-            y: originY + (sumY / n + 0.5) * cellPx,
-            size: cellPx * 1.1,
-            alpha: 1,
-            hue: 0,
-            sat: 0   // white, to match the solid QR it crossfades into
-        ))
+
+        // Synthetic outer ring -- already continuous module-coordinate
+        // space (qrFinderHalfWidth is the finder pattern's true center
+        // offset, not an index), so no extra +0.5 here.
+        let centerX = corner.x + qrFinderHalfWidth
+        let centerY = corner.y + qrFinderHalfWidth
+        for p in squareRingPoints(centerX: centerX, centerY: centerY, halfSize: qrOuterRingHalfSize, pointsPerSide: qrOuterRingPointsPerSide) {
+            guard written < out.count else { return Int32(written) }
+            out[written] = SlotTarget(
+                x: originX + p.x * cellPx,
+                y: originY + p.y * cellPx,
+                size: dotSize, alpha: 1, hue: 0, sat: 0
+            )
+            written += 1
+        }
     }
-    return result
+
+    for m in qrAlignmentModules {
+        guard written < out.count else { return Int32(written) }
+        out[written] = SlotTarget(
+            x: originX + (Float(m.x) + 0.5) * cellPx,
+            y: originY + (Float(m.y) + 0.5) * cellPx,
+            size: dotSize, alpha: 1, hue: 0, sat: 0
+        )
+        written += 1
+    }
+
+    return Int32(written)
 }

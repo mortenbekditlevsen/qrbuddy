@@ -18,14 +18,28 @@ typedef struct {
     uint8_t opa;      // 0-255 opacity
 } particle_t;
 
-#define PARTICLE_MAX_COUNT 128
+/* 160 comfortably covers the QR effect's skeleton (152 particles: 3 finder
+ * corners x (16 real inner-ring + 32 synthetic outer-ring) + 8 alignment
+ * dots) with a little headroom. particle_t is 12 bytes, so even this is
+ * under 2KB total -- the limiting factor is never memory, it's wanting the
+ * per-tick spring-physics loop to stay cheap; 160 is still trivial there. */
+#define PARTICLE_MAX_COUNT 160
 
 /* QR layout, shared so the particle-effect's silhouette (Swift) roughly lines
  * up with the solid renderer (rgb_tile.c's draw_qr) it crossfades into.
- * QR_LAYOUT_MODULES matches the fixed qrcodegen version both sides encode at. */
-#define QR_LAYOUT_MODULES       57   // qrcodegen version 10
-#define QR_LAYOUT_PX_PER_MODULE 3
-#define QR_LAYOUT_QUIET_MODULES 4    // spec-recommended quiet zone (white border) on every side
+ * QR_LAYOUT_MODULES matches the fixed qrcodegen version both sides encode at.
+ *
+ * At 41 modules (version 6) and 5px/module, the code area alone is 205px;
+ * with the spec-recommended 4-module quiet zone (+40px) that's 245px square
+ * -- 5px too tall for this display's 240px-short dimension (280x240, rotated).
+ * Quiet zone trimmed to 3 modules (+30px = 235px) to fit, since neither the
+ * version nor the module size had room to give on their own:
+ *   version 6, 5px/module, quiet 4 -> 245px (5px over)
+ *   version 6, 5px/module, quiet 3 -> 235px (fits, 5px to spare)
+ *   version 5, 5px/module, quiet 4 -> 225px (fits, but lower QR capacity) */
+#define QR_LAYOUT_MODULES       41   // qrcodegen version 6
+#define QR_LAYOUT_PX_PER_MODULE 5
+#define QR_LAYOUT_QUIET_MODULES 3
 
 /* Implemented in Swift (see main/ParticleEffects.swift). Called once per tick
  * by rgb_tile.c's particle timer: fills particles[0 ..< *out_count] (out_count
