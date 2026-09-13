@@ -75,6 +75,7 @@ void initialize(void)
     if (lvgl_port_lock(0))
     {
         lvgl_ui_init();
+        rgb_tile_show_particles();  // must run inside the lock, same as show_qr()
         lvgl_port_unlock();
     }
 }

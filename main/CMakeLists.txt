@@ -106,4 +106,5 @@ target_sources(${COMPONENT_LIB}
     NimbleUUID.swift
     Button.swift
     LED.swift
+    ParticleEffects.swift
 )
