@@ -18,28 +18,33 @@ typedef struct {
     uint8_t opa;      // 0-255 opacity
 } particle_t;
 
-/* 160 comfortably covers the QR effect's skeleton (152 particles: 3 finder
- * corners x (16 real inner-ring + 32 synthetic outer-ring) + 8 alignment
- * dots) with a little headroom. particle_t is 12 bytes, so even this is
- * under 2KB total -- the limiting factor is never memory, it's wanting the
- * per-tick spring-physics loop to stay cheap; 160 is still trivial there. */
-#define PARTICLE_MAX_COUNT 160
+/* 200 comfortably covers the QR effect's skeleton at its worst case --
+ * version 7-10 codes have 6 alignment patterns instead of 1: 3 finder
+ * corners x (16 real inner-ring + 32 synthetic outer-ring) + 6 alignment
+ * patterns x 8 dots = 192, plus a little headroom. particle_t is 12 bytes,
+ * so even this is under 2.5KB total -- the limiting factor is never memory,
+ * it's wanting the per-tick spring-physics loop to stay cheap; 200 is still
+ * trivial there. */
+#define PARTICLE_MAX_COUNT 200
 
-/* QR layout, shared so the particle-effect's silhouette (Swift) roughly lines
- * up with the solid renderer (rgb_tile.c's draw_qr) it crossfades into.
- * QR_LAYOUT_MODULES matches the fixed qrcodegen version both sides encode at.
- *
- * At 41 modules (version 6) and 5px/module, the code area alone is 205px;
- * with the spec-recommended 4-module quiet zone (+40px) that's 245px square
- * -- 5px too tall for this display's 240px-short dimension (280x240, rotated).
- * Quiet zone trimmed to 3 modules (+30px = 235px) to fit, since neither the
- * version nor the module size had room to give on their own:
- *   version 6, 5px/module, quiet 4 -> 245px (5px over)
- *   version 6, 5px/module, quiet 3 -> 235px (fits, 5px to spare)
- *   version 5, 5px/module, quiet 4 -> 225px (fits, but lower QR capacity) */
-#define QR_LAYOUT_MODULES       41   // qrcodegen version 6
-#define QR_LAYOUT_PX_PER_MODULE 5
+/* The QR encoder picks the smallest version (1-10) that fits the text (see
+ * qr_generate() in rgb_tile.c) -- module count is therefore a runtime value,
+ * not a compile-time constant, and so is the on-screen pixel size per module
+ * (rgb_tile.c fits whatever version came back into the tile's short
+ * dimension; see particle_qr_px_per_module()). Only the quiet zone width is
+ * still fixed: 3 modules, chosen (same reasoning as the old fixed-version
+ * comment this replaced) so the largest supported version still fits this
+ * display without the quiet zone needing to shrink further. */
 #define QR_LAYOUT_QUIET_MODULES 3
+
+/* Implemented in rgb_tile.c, for the Swift particle skeleton (qrTargets() in
+ * ParticleEffects.swift) to lay itself out identically to the solid QR it
+ * crossfades into. Both are 0 until particle_qr_prepare() has been called at
+ * least once (see beginTransition()'s .qr case -- it's called immediately on
+ * entering the QR effect, not lazily at crossfade time, precisely so these
+ * are valid from the skeleton's very first tick). */
+int32_t particle_qr_modules(void);
+int32_t particle_qr_px_per_module(int32_t tile_w, int32_t tile_h);
 
 /* Implemented in Swift (see main/ParticleEffects.swift). Called once per tick
  * by rgb_tile.c's particle timer: fills particles[0 ..< *out_count] (out_count

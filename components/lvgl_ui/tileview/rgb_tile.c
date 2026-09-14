@@ -8,6 +8,15 @@
 #define QR_VISIBLE_SECONDS 60  // how long the QR code stays on screen
 #define QR_BACKLIGHT     20    // backlight % while a QR code is on screen
 
+// The encoder is allowed to pick any version in this range -- it always
+// picks the smallest one the text (plus ECC) actually fits in, so short URLs
+// get a coarser, more scannable code and only long ones grow. Capped at 10
+// (57x57) since that's already tight on this display -- see
+// qr_fit_px_per_module()'s own module-size floor for what happens if a
+// caller ever ignores that cap.
+#define QR_MIN_VERSION   1
+#define QR_MAX_VERSION   10
+
 // Generic particle-effect rendering. This file has no idea which effect is
 // running (starfield, sphere, flock, ...) -- that's entirely decided in Swift
 // (see main/ParticleEffects.swift). Each tick we ask Swift to fill
@@ -42,20 +51,37 @@ static bool particle_needs_reset = false;  // true for exactly the first tick af
 static lv_timer_t *particle_tick_timer;    // ~20 Hz simulation timer, paused while inactive
 static int32_t particle_tile_w = 280, particle_tile_h = 240; // set from the real tile size on activation
 
+/* Single source of truth for "how many pixels is one module" -- used by
+ * draw_qr() itself and exposed to Swift (particle_qr_px_per_module()) so the
+ * particle skeleton lines up with whatever size the solid renderer actually
+ * draws at. Fits `modules` (plus the quiet zone on both sides) into the
+ * tile's *shorter* dimension, floor-divided -- floor rather than round so
+ * the block never overflows. Floored to a minimum of 1px/module so a
+ * pathological tiny tile still draws something instead of dividing to 0. */
+static int32_t qr_fit_px_per_module(int32_t modules, int32_t tile_w, int32_t tile_h)
+{
+    if (modules <= 0) return 0;
+    int32_t short_dim = tile_w < tile_h ? tile_w : tile_h;
+    int32_t px = short_dim / (modules + 2 * QR_LAYOUT_QUIET_MODULES);
+    return px < 1 ? 1 : px;
+}
+
 static bool qr_generate(const char * text)
 {
-    uint8_t qrcode[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
-    uint8_t tempBuffer[qrcodegen_BUFFER_LEN_FOR_VERSION(6)];
+    uint8_t qrcode[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
+    uint8_t tempBuffer[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
 
-    // Forcing version 6 keeps it at 41x41 (QR_LAYOUT_MODULES) to match what
-    // we've been drawing -- see particle.h for why 6/5px/3-module-quiet is
-    // the combination that actually fits this display.
+    // minVersion/maxVersion span QR_MIN_VERSION..QR_MAX_VERSION -- qrcodegen
+    // itself picks the smallest version in that range the text (plus ECC)
+    // actually fits in, so this is the entire "dynamic version" feature on
+    // the encode side; module count (and everything downstream: on-screen
+    // pixel size, particle skeleton layout) just follows whatever came back.
     bool ok = qrcodegen_encodeText(
         text,
         tempBuffer,
         qrcode,
         qrcodegen_Ecc_MEDIUM,
-        6, 6,                   // minVersion, maxVersion — locked to 41x41
+        QR_MIN_VERSION, QR_MAX_VERSION,
         qrcodegen_Mask_AUTO,
         true);
 
@@ -70,6 +96,16 @@ static bool qr_generate(const char * text)
     return true;
 }
 
+int32_t particle_qr_modules(void)
+{
+    return qr_modules;
+}
+
+int32_t particle_qr_px_per_module(int32_t tile_w, int32_t tile_h)
+{
+    return qr_fit_px_per_module(qr_modules, tile_w, tile_h);
+}
+
 /* Draws the fully-detailed, solid QR (border included) at `overlay_opa`
  * (0 = skip entirely, 255 = fully opaque). Used both for the "real"
  * BLE-triggered display (always LV_OPA_COVER) and, at a Swift-ramped partial
@@ -80,8 +116,9 @@ static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords, lv_opa_t ove
 
     int32_t obj_w = lv_area_get_width(obj_coords);
     int32_t obj_h = lv_area_get_height(obj_coords);
-    int32_t qr_px = qr_modules * QR_LAYOUT_PX_PER_MODULE;
-    int32_t quiet_px = QR_LAYOUT_QUIET_MODULES * QR_LAYOUT_PX_PER_MODULE;
+    int32_t px_per_module = qr_fit_px_per_module(qr_modules, obj_w, obj_h);
+    int32_t qr_px = qr_modules * px_per_module;
+    int32_t quiet_px = QR_LAYOUT_QUIET_MODULES * px_per_module;
 
     // Center both ways. (Previously top-aligned with a fixed +20 offset to
     // leave room for the countdown label below -- but that offset is *in
@@ -128,10 +165,10 @@ static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords, lv_opa_t ove
             int run_len = c - run_start;
 
             lv_area_t module_area;
-            module_area.x1 = origin_x + run_start * QR_LAYOUT_PX_PER_MODULE;
-            module_area.y1 = origin_y + r * QR_LAYOUT_PX_PER_MODULE;
-            module_area.x2 = module_area.x1 + run_len * QR_LAYOUT_PX_PER_MODULE - 1;
-            module_area.y2 = module_area.y1 + QR_LAYOUT_PX_PER_MODULE - 1;
+            module_area.x1 = origin_x + run_start * px_per_module;
+            module_area.y1 = origin_y + r * px_per_module;
+            module_area.x2 = module_area.x1 + run_len * px_per_module - 1;
+            module_area.y2 = module_area.y1 + px_per_module - 1;
 
             lv_draw_rect(layer, &dsc, &module_area);
         }

@@ -1,0 +1,291 @@
+# qrbuddy — App-Level BLE Provisioning (QR + Proof-of-Possession)
+
+Status: design draft, not yet implemented.
+Audience: firmware implementer (this repo) + client (mobile app) developer.
+
+## 1. Goal
+
+Replace/avoid native BLE pairing (the OS-level "Enter the code shown on your
+device" dialog) with an application-level scheme: the device shows a QR code
+containing a short-lived proof-of-possession (POP) code, the app scans it,
+and the two sides run a key exchange authenticated by that POP. All GATT
+traffic is then encrypted at the payload level — native BLE pairing/bonding
+is never invoked, so ATT permissions on our characteristics stay
+"no security required" throughout.
+
+This was chosen over native Passkey Entry pairing specifically to avoid the
+iOS limitation where an app cannot programmatically un-pair a bonded device
+(the user has to visit Settings → Bluetooth → Forget This Device). The
+app-level scheme re-pairs cleanly on both platforms because it never touches
+OS-level bonding state at all.
+
+## 2. Threat model
+
+**Protects against:**
+- Passive eavesdropping on the BLE link (all app data is AES-GCM encrypted).
+- An active BLE man-in-the-middle who did not see the QR code (they can
+  observe/relay the public BLE handshake bytes, but can't derive the correct
+  session key without the POP, so their messages fail AEAD/HMAC checks).
+- A phone that was never provisioned trying to control the device (no
+  stored trust entry → rejected).
+
+**Does not protect against:**
+- Someone who can see the device's screen (the QR/POP is, by design, the
+  credential — this is "proof you're standing in front of the device," not
+  proof of any deeper identity).
+- Compromise of the phone's local key storage (Keychain/Keystore) after
+  pairing.
+- Physical/firmware-level attacks on the ESP32-C6 itself.
+
+This is a reasonable bar for a personal device paired by its owner — not a
+substitute for a managed enterprise credential system.
+
+## 3. Two flows
+
+### 3a. Pairing (first time, or after a reset)
+
+```mermaid
+sequenceDiagram
+    participant D as Device
+    participant A as App
+
+    Note over D: Pairing window open<br/>generates POP, shows QR
+    A->>A: Scan QR → {name, svc, pop}
+    A->>D: connect (plain BLE, no OS pairing)
+    A->>D: ClientHello: client_id, client_pub (X25519)
+    D->>D: generate device ephemeral keypair
+    D->>D: Z = X25519(device_priv, client_pub)
+    D->>D: session_key = HKDF(Z, salt=POP, info="qrbuddy-pair-v1")
+    D->>A: DeviceHello: device_pub, confirm_tag_device
+    A->>A: Z = X25519(client_priv, device_pub)
+    A->>A: session_key = HKDF(Z, salt=POP, info="qrbuddy-pair-v1")
+    A->>A: verify confirm_tag_device
+    A->>D: ClientConfirm: confirm_tag_client
+    D->>D: verify confirm_tag_client
+    D->>D: LTK = HKDF(session_key, info="qrbuddy-ltk-v1")
+    D->>D: store {client_id → LTK} in NVS
+    D->>A: PairingComplete
+    A->>A: LTK = HKDF(session_key, info="qrbuddy-ltk-v1")
+    A->>A: store {client_id, LTK} in Keychain/Keystore
+    Note over D,A: session_key now used for encrypted app traffic
+```
+
+### 3b. Resume (every later reconnect — no QR, no user action)
+
+```mermaid
+sequenceDiagram
+    participant D as Device
+    participant A as App
+
+    A->>D: connect
+    A->>D: ResumeHello: client_id, client_pub (fresh ephemeral)
+    D->>D: lookup LTK for client_id (fail → NotPaired error)
+    D->>D: generate fresh device ephemeral keypair
+    D->>D: Z = X25519(device_priv, client_pub)
+    D->>D: session_key = HKDF(Z, salt=LTK, info="qrbuddy-resume-v1")
+    D->>A: ResumeDeviceHello: device_pub, confirm_tag_device
+    A->>A: same derivation using stored LTK
+    A->>A: verify confirm_tag_device
+    A->>D: ResumeClientConfirm: confirm_tag_client
+    D->>D: verify confirm_tag_client
+    D->>A: ResumeComplete
+    Note over D,A: fresh session_key this connection (forward secrecy)
+```
+
+A fresh ephemeral key exchange on every connection (rather than reusing a
+static session) means captured traffic from one session doesn't compromise
+another, even though the long-term trust (`client_id → LTK`) is what's
+actually persisted.
+
+### 3c. Re-pairing (button held at boot, or an authenticated "reset pairing" command)
+
+1. Device erases the stored `{client_id → LTK}` entry (and, if you extend to
+   multiple trusted clients later, all of them — or a chosen one).
+2. Device generates a new POP, opens a fresh pairing window, shows the QR.
+3. Any previously-paired app's `ResumeHello` now fails lookup on the device
+   (`NotPaired`) — the app should treat that as "please re-scan" and drop
+   back into the pairing flow (3a). No OS-level state to clean up on the
+   phone at all.
+
+## 4. GATT layout
+
+Reuses the existing control service; add two characteristics:
+
+| Characteristic | Properties | Purpose |
+|---|---|---|
+| `PROV_STATE` | Read, Notify | 1 byte: `0` = unpaired/awaiting pairing, `1` = paired (idle), `2` = pairing window open |
+| `PROV_HANDSHAKE` | Write, Notify | Carries the opcode-framed handshake messages below (both directions) |
+
+The existing five property characteristics (URL, motor control, etc.) are
+unchanged at the GATT level — reads/writes to them just carry encrypted
+envelopes (§6) instead of plaintext once a session exists. No new ATT
+permissions are needed on them; the device enforces "session established"
+itself and treats undecryptable/absent-session traffic as a no-op.
+
+## 5. Handshake wire format
+
+Single byte opcode, followed by a fixed-layout payload (all multi-byte
+integers little-endian; all keys/tags raw bytes, not base64, over BLE):
+
+| Opcode | Name | Direction | Payload |
+|---|---|---|---|
+| `0x01` | ClientHello | App → Device | `client_id`(16) `client_pub`(32) |
+| `0x02` | DeviceHello | Device → App | `device_pub`(32) `confirm_tag_device`(16) |
+| `0x03` | ClientConfirm | App → Device | `confirm_tag_client`(16) |
+| `0x04` | PairingComplete | Device → App | *(empty)* |
+| `0x05` | ResumeHello | App → Device | `client_id`(16) `client_pub`(32) |
+| `0x06` | ResumeDeviceHello | Device → App | `device_pub`(32) `confirm_tag_device`(16) |
+| `0x07` | ResumeClientConfirm | App → Device | `confirm_tag_client`(16) |
+| `0x08` | ResumeComplete | Device → App | *(empty)* |
+| `0x7F` | Nack | Device → App | `reason`(1): `1`=not paired, `2`=bad confirm, `3`=pairing window closed, `4`=rate-limited |
+
+`client_id` is 16 random bytes the app generates once at first pairing and
+reuses on every future resume — it's just a lookup key, not a secret.
+
+## 6. Crypto
+
+- **Key agreement**: X25519 (Curve25519 ECDH). Both sides generate a fresh
+  ephemeral keypair per handshake (pairing *and* resume) — never reuse a
+  keypair across connections.
+- **KDF**: HKDF-SHA256.
+  - Pairing session key: `HKDF(ikm=Z, salt=POP_bytes, info="qrbuddy-pair-v1", len=32)`
+  - Resume session key: `HKDF(ikm=Z, salt=stored_LTK, info="qrbuddy-resume-v1", len=32)`
+  - Long-term key (minted once, right after a successful pairing confirm,
+    independently by both sides — never sent over the air):
+    `HKDF(ikm=session_key, info="qrbuddy-ltk-v1", len=32)`
+- **Confirm tags** (direction-tagged to prevent a trivial echo/reflection):
+  - `confirm_tag_device = HMAC-SHA256(session_key, "qrbuddy-confirm-device-v1")[0:16]`
+  - `confirm_tag_client = HMAC-SHA256(session_key, "qrbuddy-confirm-client-v1")[0:16]`
+- **App data**: AES-256-GCM, key = `session_key` directly (32 bytes — no
+  truncation needed). Nonce (12 bytes) = `direction_byte`(1) `counter`(4, BE)
+  `zero`(7), where `direction_byte` is `0x00` for app→device and `0x01` for
+  device→app, and `counter` is a per-direction, per-connection counter
+  starting at 0 (never persisted — a new connection means a new
+  `session_key`, so counters can safely restart). Wire framing for an
+  encrypted characteristic payload: `counter(4, LE) || ciphertext_and_tag`
+  (the direction byte isn't transmitted — it's implicit from which side is
+  sending).
+
+All of the above (X25519, HKDF, HMAC-SHA256, AES-GCM) are standard-library
+primitives on every relevant platform:
+- Firmware: mbedtls (bundled with ESP-IDF) — `mbedtls_ecdh_*`/`mbedtls_ecp`
+  with `MBEDTLS_ECP_DP_CURVE25519`, `mbedtls_hkdf`, `mbedtls_md_hmac`,
+  `mbedtls_gcm_*`.
+- iOS: CryptoKit (`Curve25519.KeyAgreement`, `HKDF`, `HMAC`, `AES.GCM`).
+- Android: `javax.crypto` + a modern provider (Conscrypt, or Google Tink)
+  for X25519/HKDF; `AES/GCM/NoPadding` is available natively.
+
+## 7. POP (proof-of-possession) code
+
+- 8 characters, Crockford base32 alphabet (`0123456789ABCDEFGHJKMNPQRSTVWXYZ`
+  — excludes ambiguous `I`/`L`/`O`/`U`), ~40 bits of entropy. Short enough to
+  read aloud/type as a fallback if a QR scan fails; the QR is still the
+  primary path.
+- Generated fresh every time a pairing window opens (first boot, or after a
+  reset), using the device's HRNG (`esp_fill_random`).
+- **Pairing window**: closes automatically after a timeout (suggest 5
+  minutes) if unused, and after some number of failed `ClientConfirm`
+  attempts (suggest 5) — both cases return to normal idle behavior and
+  require a fresh button-press/boot to reopen. This bounds how long an
+  8-character code is guessable over the air.
+
+## 8. QR payload
+
+Compact JSON, encoded directly into the QR (reuses the existing `draw_qr`
+renderer — same renderer already used for the URL-display feature, just fed
+a different string):
+
+```json
+{"v":1,"name":"Ka-ching AA:BB:CC:DD:EE:FF","svc":"6E400010-XXXX-XXXX-XXXX-XXXXXXXXXXXX","pop":"7K2M9XAB"}
+```
+
+`name` disambiguates when multiple qrbuddy units are being provisioned near
+each other (matches the existing advertised local name); `svc` is the
+already-advertised control service UUID, so the app can `scanForPeripherals
+(withServices:)`-filter directly.
+
+## 9. Firmware implementation path
+
+1. **Crypto helpers** — thin wrappers around mbedtls for: X25519 keypair
+   gen + ECDH, HKDF-SHA256, HMAC-SHA256, AES-256-GCM encrypt/decrypt. Keep
+   these as plain C (or a small Swift wrapper calling into mbedtls via the
+   existing bridging-header pattern) — no need to hand-roll any primitive.
+2. **NVS storage** — a small namespace (e.g. `qrb_pair`) holding, at most,
+   one `{client_id(16) → LTK(32)}` entry for v1 (see §11 for multi-client).
+   Empty/absent on first-ever boot.
+3. **Boot-time state**: if no stored trust entry, enter pairing mode
+   immediately (generate POP, render QR) — this is also what a factory-fresh
+   unit does out of the box. If a trust entry exists, boot straight into
+   normal idle behavior; `PROV_STATE` reads `1`.
+4. **GATT additions**: add `PROV_STATE`/`PROV_HANDSHAKE` characteristics to
+   the existing `setupGATTServer()` (or wherever the control service is
+   defined) and a write handler implementing the opcode table in §5 (both
+   the pairing and resume branches — they share almost all the logic, just
+   differ in what's used as the HKDF salt and whether a new LTK gets minted
+   at the end).
+5. **Per-connection session state**: a small fixed-size table keyed by
+   `conn_handle` (bounded by `CONFIG_BT_NIMBLE_MAX_CONNECTIONS`) holding
+   `session_key` + the two per-direction nonce counters + whether the
+   session is established. Clear the entry on disconnect.
+6. **Wrap existing property read/write handlers**: decrypt incoming writes
+   using the connection's `session_key` before handing the plaintext to the
+   existing property-storage logic (§ current `readPropertyValue`/property
+   array in `Main.swift`); encrypt outgoing reads the same way. No session
+   established → treat as a no-op (don't leak plaintext, don't apply
+   unauthenticated writes).
+7. **QR rendering**: feed the JSON payload from §8 into the existing
+   `draw_qr` path instead of a URL — no renderer changes needed, just a
+   different call site and string.
+8. **Re-pairing trigger**: wire a button-hold-at-boot check (or an
+   authenticated `PROV_RESET` command over an already-established session,
+   for a "reset pairing" button inside the app itself) to: erase the NVS
+   trust entry, generate a new POP, re-enter pairing mode, re-render the QR.
+9. **Rate limiting / timeout**: track failed `ClientConfirm`/
+   `ResumeClientConfirm` attempts and pairing-window age; enforce §7's
+   limits by sending `Nack` and, once exceeded, closing the window (back to
+   whatever the device would otherwise be showing).
+
+## 10. Client implementation path
+
+1. **BLE central**: standard scan (filter on the `svc` UUID from the QR) →
+   connect. No native pairing/bonding requested at any point.
+2. **QR scanning**: decode the JSON payload (§8) with any standard
+   camera+QR library (`AVFoundation`/`Vision` on iOS, `CameraX`+`ML Kit` on
+   Android).
+3. **Crypto**: implement X25519 keygen/ECDH, HKDF-SHA256, HMAC-SHA256,
+   AES-256-GCM exactly as specified in §6 — all available as
+   platform-native APIs (CryptoKit / javax.crypto+Tink).
+4. **Pairing flow**: generate (once, ever, per install) a random 16-byte
+   `client_id`; on first-ever connection to a device (or after getting a
+   `Nack(not paired)` on resume), run the §3a exchange over
+   `PROV_HANDSHAKE`, verify `confirm_tag_device`, send
+   `confirm_tag_client`, and on `PairingComplete` derive and persist
+   `{client_id, LTK}` in Keychain/Keystore.
+5. **Resume flow**: on every later connection, run §3b using the stored
+   `client_id`/`LTK` — no user interaction, no QR.
+6. **Application traffic**: encrypt/decrypt property reads/writes using the
+   per-connection `session_key` and the nonce/framing scheme in §6.
+7. **Error/UX handling**:
+   - `Nack(not paired)` on resume → drop into the pairing flow, prompt the
+     user to scan the QR again (covers first-ever use and post-reset).
+   - `Nack(bad confirm)` / `Nack(rate-limited)` during pairing → surface a
+     clear retry prompt (wrong/expired code).
+   - Handle a mid-handshake disconnect by just retrying the whole handshake
+     on reconnect — nothing is partially committed on the device side until
+     `ClientConfirm` succeeds.
+
+## 11. Open questions / deliberately deferred
+
+- **Multi-client support**: v1 above stores a single trusted `client_id`.
+  Extending to a small fixed list (e.g. a few family members' phones) is a
+  storage-shape change only (NVS holds a list instead of one entry, resume
+  does a lookup instead of an equality check) — not a protocol redesign.
+  Worth deciding before the client dev builds their local-storage layer, in
+  case "one trusted phone at a time" isn't actually the desired product
+  behavior.
+- **In-app "reset pairing"**: §9 mentions an authenticated `PROV_RESET`
+  command as an alternative to the physical button. Decide whether that's
+  wanted for v1 or left for later.
+- **Exact POP length/timeout/lockout numbers** in §7 are suggestions, not
+  fixed — tune once real usage patterns (how long someone typically takes
+  to scan) are known.
