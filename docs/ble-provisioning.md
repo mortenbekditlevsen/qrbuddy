@@ -97,7 +97,13 @@ static session) means captured traffic from one session doesn't compromise
 another, even though the long-term trust (`client_id → LTK`) is what's
 actually persisted.
 
-### 3c. Re-pairing (button held at boot, or an authenticated "reset pairing" command)
+### 3c. Re-pairing (held upside-down for 5s at boot, or an authenticated "reset pairing" command)
+
+The physical buttons on this unit are hard to reach, so the trigger is a
+held gesture instead of a button: hold the unit upside-down while powering
+it up (checked via the onboard QMI8658 accelerometer) for 5 continuous
+seconds. Checked once at boot, before BLE comes up, so it works regardless
+of whether pairing/advertising even succeed.
 
 1. Device erases the stored `{client_id → LTK}` entry (and, if you extend to
    multiple trusted clients later, all of them — or a chosen one).
@@ -116,11 +122,20 @@ Reuses the existing control service; add two characteristics:
 | `PROV_STATE` | Read, Notify | 1 byte: `0` = unpaired/awaiting pairing, `1` = paired (idle), `2` = pairing window open |
 | `PROV_HANDSHAKE` | Write, Notify | Carries the opcode-framed handshake messages below (both directions) |
 
-The existing five property characteristics (URL, motor control, etc.) are
-unchanged at the GATT level — reads/writes to them just carry encrypted
-envelopes (§6) instead of plaintext once a session exists. No new ATT
-permissions are needed on them; the device enforces "session established"
-itself and treats undecryptable/absent-session traffic as a no-op.
+The original design (v1 of this doc) had five fixed property
+characteristics (a URL text value, four raw 4-byte slots). That's been
+replaced with a single command characteristic instead — a fixed property
+per feature doesn't scale as features are added, and a new command is just
+a new opcode value rather than new GATT surface:
+
+| Characteristic | Properties | Purpose |
+|---|---|---|
+| `CMD` | Write | `[opcode: 1 byte][payload: opcode-dependent]`, encrypted (§6) the same as everything else. Write-only and no acknowledgement — see §5b. |
+
+No new ATT permissions are needed on it; the device enforces "session
+established" itself and treats undecryptable/absent-session/malformed
+traffic as a no-op (a normal ATT write-response error, not an
+application-level Nack).
 
 ## 5. Handshake wire format
 
@@ -138,6 +153,27 @@ integers little-endian; all keys/tags raw bytes, not base64, over BLE):
 | `0x07` | ResumeClientConfirm | App → Device | `confirm_tag_client`(16) |
 | `0x08` | ResumeComplete | Device → App | *(empty)* |
 | `0x7F` | Nack | Device → App | `reason`(1): `1`=not paired, `2`=bad confirm, `3`=pairing window closed, `4`=rate-limited |
+
+## 5b. Command opcodes (`CMD`, post-pairing)
+
+Same shape as the handshake — opcode byte + payload, this time carried
+inside the AES-GCM envelope from §6 (so the whole `[opcode][payload]` blob
+*is* the plaintext the app encrypts before writing `CMD`). App → device
+only; there's no device → app direction on this characteristic.
+
+| Opcode | Name | Payload |
+|---|---|---|
+| `0x01` | ShowQR | UTF-8 text to encode (variable length, non-empty) |
+| `0x02` | Idle | *(empty)* — backlight off, blank the tile |
+| `0x03` | DemoEffects | *(empty)* — run the particle idle-effect cycle |
+
+Extending this: append a new opcode value, never renumber or reuse one
+already shipped (deprecate by leaving it unused). A device that doesn't
+recognize an opcode, or gets a payload that doesn't match what that opcode
+expects, returns a normal ATT write-response error — there's no
+application-level acknowledgement on success (decided not needed for this
+product; add a `CMD_STATUS` read+notify characteristic later if that
+changes).
 
 `client_id` is 16 random bytes the app generates once at first pairing and
 reuses on every future resume — it's just a lookup key, not a secret.
@@ -157,20 +193,35 @@ reuses on every future resume — it's just a lookup key, not a secret.
   - `confirm_tag_device = HMAC-SHA256(session_key, "qrbuddy-confirm-device-v1")[0:16]`
   - `confirm_tag_client = HMAC-SHA256(session_key, "qrbuddy-confirm-client-v1")[0:16]`
 - **App data**: AES-256-GCM, key = `session_key` directly (32 bytes — no
-  truncation needed). Nonce (12 bytes) = `direction_byte`(1) `counter`(4, BE)
-  `zero`(7), where `direction_byte` is `0x00` for app→device and `0x01` for
-  device→app, and `counter` is a per-direction, per-connection counter
-  starting at 0 (never persisted — a new connection means a new
-  `session_key`, so counters can safely restart). Wire framing for an
-  encrypted characteristic payload: `counter(4, LE) || ciphertext_and_tag`
-  (the direction byte isn't transmitted — it's implicit from which side is
-  sending).
+  truncation needed). Nonce (12 bytes) = `direction_byte`(1) `counter`(4,
+  little-endian) `zero`(7) — same byte order as the wire framing below, no
+  separate big-endian form — where `direction_byte` is `0x00` for
+  app→device and `0x01` for device→app, and `counter` is a per-direction,
+  per-connection counter starting at 0 (never persisted — a new connection
+  means a new `session_key`, so counters can safely restart; the device, as
+  receiver of app→device writes, doesn't independently track/enforce this
+  counter — it just uses whatever value the sender included. Only the
+  *sender* of each direction must never repeat a counter value within one
+  connection, to avoid GCM nonce reuse; this isn't full replay protection,
+  consistent with this doc's threat model in §2). Wire framing for an
+  encrypted characteristic payload: `counter(4, little-endian) ||
+  ciphertext_and_tag` (the direction byte isn't transmitted — it's implicit
+  from which side is sending, and from that same byte order feeding the
+  nonce above).
 
 All of the above (X25519, HKDF, HMAC-SHA256, AES-GCM) are standard-library
 primitives on every relevant platform:
-- Firmware: mbedtls (bundled with ESP-IDF) — `mbedtls_ecdh_*`/`mbedtls_ecp`
-  with `MBEDTLS_ECP_DP_CURVE25519`, `mbedtls_hkdf`, `mbedtls_md_hmac`,
-  `mbedtls_gcm_*`.
+- Firmware: mbedtls (bundled with ESP-IDF) — `mbedtls_ecp_gen_keypair`/
+  `mbedtls_ecdh_compute_shared`/`mbedtls_ecp_point_write_binary`/
+  `read_binary` with `MBEDTLS_ECP_DP_CURVE25519` (deliberately *not* the
+  higher-level `mbedtls_ecdh_make_public`/`read_public` convenience API —
+  those wrap the point in an extra TLS-style length-prefix byte we don't
+  want on the wire), `mbedtls_md_hmac` (HKDF is hand-rolled as two HMAC
+  calls per RFC 5869, since `MBEDTLS_HKDF_C` isn't enabled in this
+  project's mbedtls config and a single 32-byte output block doesn't need
+  the library's multi-block Expand loop anyway), `mbedtls_gcm_*`. All of
+  this was verified against RFC 7748's own worked Diffie-Hellman example
+  (§6.1) before implementation — see components/pairing/pairing.c.
 - iOS: CryptoKit (`Curve25519.KeyAgreement`, `HKDF`, `HMAC`, `AES.GCM`).
 - Android: `javax.crypto` + a modern provider (Conscrypt, or Google Tink)
   for X25519/HKDF; `AES/GCM/NoPadding` is available natively.
@@ -227,19 +278,24 @@ already-advertised control service UUID, so the app can `scanForPeripherals
    `conn_handle` (bounded by `CONFIG_BT_NIMBLE_MAX_CONNECTIONS`) holding
    `session_key` + the two per-direction nonce counters + whether the
    session is established. Clear the entry on disconnect.
-6. **Wrap existing property read/write handlers**: decrypt incoming writes
-   using the connection's `session_key` before handing the plaintext to the
-   existing property-storage logic (§ current `readPropertyValue`/property
-   array in `Main.swift`); encrypt outgoing reads the same way. No session
-   established → treat as a no-op (don't leak plaintext, don't apply
-   unauthenticated writes).
+6. **`CMD` write handler**: decrypt the write using the connection's
+   `session_key` (no session established → treat as a no-op, a normal ATT
+   error, never fall back to trusting plaintext), parse the opcode+payload
+   per §5b, dispatch. See `GATTServer.swift`'s `Command` enum — adding a
+   new command later is a new `case` there plus a line in `parse()`, not a
+   GATT change.
 7. **QR rendering**: feed the JSON payload from §8 into the existing
    `draw_qr` path instead of a URL — no renderer changes needed, just a
    different call site and string.
-8. **Re-pairing trigger**: wire a button-hold-at-boot check (or an
-   authenticated `PROV_RESET` command over an already-established session,
-   for a "reset pairing" button inside the app itself) to: erase the NVS
-   trust entry, generate a new POP, re-enter pairing mode, re-render the QR.
+8. **Re-pairing trigger**: a boot-time check (physical buttons on this unit
+   are hard to reach, so this polls the onboard QMI8658 accelerometer for 5
+   continuous seconds of upside-down orientation instead) erases the NVS
+   trust entry; the normal startup path then notices there's none and opens
+   a fresh pairing window / renders the QR itself, no separate "re-render"
+   step needed. (An authenticated `PROV_RESET` command over an
+   already-established session, for a "reset pairing" button inside the app
+   itself, is still a reasonable addition later — see the open question
+   below.)
 9. **Rate limiting / timeout**: track failed `ClientConfirm`/
    `ResumeClientConfirm` attempts and pairing-window age; enforce §7's
    limits by sending `Nack` and, once exceeded, closing the window (back to
@@ -263,8 +319,11 @@ already-advertised control service UUID, so the app can `scanForPeripherals
    `{client_id, LTK}` in Keychain/Keystore.
 5. **Resume flow**: on every later connection, run §3b using the stored
    `client_id`/`LTK` — no user interaction, no QR.
-6. **Application traffic**: encrypt/decrypt property reads/writes using the
-   per-connection `session_key` and the nonce/framing scheme in §6.
+6. **Sending commands**: build `[opcode][payload]` per §5b, encrypt with the
+   per-connection `session_key` and the nonce/framing scheme in §6, write to
+   `CMD`. Write-only, no response payload to read back — a failed write
+   (bad session, unknown opcode, malformed payload) surfaces as a normal
+   ATT write error.
 7. **Error/UX handling**:
    - `Nack(not paired)` on resume → drop into the pairing flow, prompt the
      user to scan the QR again (covers first-ever use and post-reset).

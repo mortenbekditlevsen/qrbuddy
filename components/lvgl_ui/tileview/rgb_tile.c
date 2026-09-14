@@ -41,6 +41,7 @@ static uint8_t particle_qr_overlay_opa = 0;
 
 static lv_obj_t *obj_rgb_tile;
 static lv_obj_t *qr_countdown_label;   // "seconds left" label, hidden while no QR
+static lv_obj_t *pairing_message_label;   // pairing flow's "scan this" helper text, hidden otherwise
 static lv_timer_t *qr_tick_timer;      // 1 Hz countdown timer, paused while no QR
 static int qr_seconds_left;
 
@@ -244,6 +245,11 @@ static void stop_particles(void)
     particle_qr_overlay_opa = 0;   // don't let a stale crossfade linger into the next activation
 }
 
+static void stop_message(void)
+{
+    if (pairing_message_label) lv_obj_add_flag(pairing_message_label, LV_OBJ_FLAG_HIDDEN);
+}
+
 /* Take the QR code off screen: stop the countdown, blank the tile, backlight off. */
 static void hide_qr(void)
 {
@@ -303,34 +309,87 @@ void rgb_tile_init(lv_obj_t *parent)
     particle_tick_timer = lv_timer_create(particle_tick_cb, PARTICLE_TICK_MS, NULL);
     lv_timer_pause(particle_tick_timer);
 
+    // A plain wrapped/centered label, not custom-drawn like the QR/particles
+    // -- used for the pairing flow's "scan this in <app>" helper screen,
+    // which Swift alternates with the pairing QR (see Main.swift). 80%
+    // width leaves a margin so long strings wrap instead of clipping.
+    pairing_message_label = lv_label_create(parent);
+    lv_obj_set_style_text_font(pairing_message_label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(pairing_message_label, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_align(pairing_message_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_label_set_long_mode(pairing_message_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(pairing_message_label, lv_pct(80));
+    lv_obj_center(pairing_message_label);
+    lv_obj_add_flag(pairing_message_label, LV_OBJ_FLAG_HIDDEN);
+
     lv_obj_add_event_cb(parent, rgb_tile_draw_event_cb, LV_EVENT_DRAW_POST, NULL);
 
     rgb_tile_show_qr("https://ka-ching.dk");
 }
 
-/* Regenerate the QR code, repaint the tile, and (re)start the countdown.
- * The caller MUST already hold the LVGL port lock (lvgl_port_lock), because this
- * mutates qr_buf/qr_modules which draw_qr reads on the LVGL task. */
-void rgb_tile_show_qr(const char *text)
+/* Shared by rgb_tile_show_qr()/rgb_tile_show_qr_persistent() -- `persistent`
+ * skips arming the countdown label/timer, so the code stays up until
+ * something else explicitly takes the tile back (see docs/ble-provisioning.md
+ * for why the pairing QR needs this instead of the fixed QR_VISIBLE_SECONDS
+ * used everywhere else). The caller MUST already hold the LVGL port lock
+ * (lvgl_port_lock), because this mutates qr_buf/qr_modules which draw_qr
+ * reads on the LVGL task. */
+static void show_qr_internal(const char *text, bool persistent)
 {
     if (!qr_generate(text)) {
         return; /* text too long for the fixed QR version; keep the previous code */
     }
     stop_particles();  // mutually exclusive with the QR code on this tile
+    stop_message();
 
     qr_visible = true;
     bsp_display_set_brightness(QR_BACKLIGHT);   // wake the backlight for the QR
 
-    qr_seconds_left = QR_VISIBLE_SECONDS;
-    if (qr_countdown_label) {
-        lv_label_set_text_fmt(qr_countdown_label, "%d", qr_seconds_left);
-        lv_obj_remove_flag(qr_countdown_label, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (qr_tick_timer) {
-        lv_timer_reset(qr_tick_timer);    // full 1 s before the first decrement
-        lv_timer_resume(qr_tick_timer);
+    if (persistent) {
+        if (qr_tick_timer) lv_timer_pause(qr_tick_timer);
+        if (qr_countdown_label) lv_obj_add_flag(qr_countdown_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        qr_seconds_left = QR_VISIBLE_SECONDS;
+        if (qr_countdown_label) {
+            lv_label_set_text_fmt(qr_countdown_label, "%d", qr_seconds_left);
+            lv_obj_remove_flag(qr_countdown_label, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (qr_tick_timer) {
+            lv_timer_reset(qr_tick_timer);    // full 1 s before the first decrement
+            lv_timer_resume(qr_tick_timer);
+        }
     }
 
+    if (obj_rgb_tile) {
+        lv_obj_invalidate(obj_rgb_tile);
+    }
+}
+
+void rgb_tile_show_qr(const char *text)
+{
+    show_qr_internal(text, false);
+}
+
+void rgb_tile_show_qr_persistent(const char *text)
+{
+    show_qr_internal(text, true);
+}
+
+/* A plain, persistent, centered/wrapped text screen -- the pairing flow's
+ * "scan this in <app>" helper text, which Swift alternates with the
+ * pairing QR (see Main.swift). Mutually exclusive with the QR and particle
+ * effect, same as those are with each other. The caller MUST already hold
+ * the LVGL port lock (lvgl_port_lock). */
+void rgb_tile_show_message(const char *text)
+{
+    stop_qr();
+    stop_particles();
+
+    bsp_display_set_brightness(QR_BACKLIGHT);   // same level as the QR screen it alternates with -- no brightness flicker
+    if (pairing_message_label) {
+        lv_label_set_text(pairing_message_label, text);
+        lv_obj_remove_flag(pairing_message_label, LV_OBJ_FLAG_HIDDEN);
+    }
     if (obj_rgb_tile) {
         lv_obj_invalidate(obj_rgb_tile);
     }
@@ -345,6 +404,7 @@ void rgb_tile_show_qr(const char *text)
 void rgb_tile_show_particles(void)
 {
     stop_qr();  // mutually exclusive with the QR code on this tile
+    stop_message();
 
     if (obj_rgb_tile) {
         int32_t w = lv_obj_get_width(obj_rgb_tile);
@@ -371,6 +431,21 @@ void rgb_tile_show_particles(void)
 void rgb_tile_hide_particles(void)
 {
     stop_particles();
+    if (obj_rgb_tile) {
+        lv_obj_invalidate(obj_rgb_tile);
+    }
+    bsp_display_set_brightness(0);
+}
+
+/* The command interface's Idle: blank the tile and turn the backlight off,
+ * regardless of whichever of QR/particles/message was showing -- unlike
+ * hide_qr()/rgb_tile_hide_particles(), which only ever needed to stop their
+ * own mode since nothing else could have been active at the same time. */
+void rgb_tile_idle(void)
+{
+    stop_qr();
+    stop_particles();
+    stop_message();
     if (obj_rgb_tile) {
         lv_obj_invalidate(obj_rgb_tile);
     }

@@ -3,7 +3,7 @@ idf_component_register(
     SRCS /dev/null # We don't have any C++ sources
     PRIV_INCLUDE_DIRS "."
     LDFRAGMENTS "linker.lf"
-    REQUIRES bt driver lvgl_ui qrcodegen
+    REQUIRES bt driver lvgl_ui qrcodegen pairing
 )
 
 
@@ -107,4 +107,5 @@ target_sources(${COMPONENT_LIB}
     Button.swift
     LED.swift
     ParticleEffects.swift
+    Pairing.swift
 )

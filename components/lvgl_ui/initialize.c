@@ -16,6 +16,8 @@
 #include "lvgl_ui.h"
 
 #include "bsp_pwr.h"
+#include "bsp_i2c.h"
+#include "bsp_qmi8658.h"
 
 #define EXAMPLE_DISPLAY_ROTATION 270
 
@@ -53,6 +55,66 @@ void show_qr(const char * text) {
     }
 }
 
+void show_qr_persistent(const char * text) {
+    if (lvgl_port_lock(0)) {
+        rgb_tile_show_qr_persistent(text);
+        lvgl_port_unlock();
+    } else {
+        ESP_LOGW(TAG, "show_qr_persistent: could not acquire LVGL lock");
+    }
+}
+
+void show_message_persistent(const char * text) {
+    if (lvgl_port_lock(0)) {
+        rgb_tile_show_message(text);
+        lvgl_port_unlock();
+    } else {
+        ESP_LOGW(TAG, "show_message_persistent: could not acquire LVGL lock");
+    }
+}
+
+void show_particles(void) {
+    if (lvgl_port_lock(0)) {
+        rgb_tile_show_particles();
+        lvgl_port_unlock();
+    } else {
+        ESP_LOGW(TAG, "show_particles: could not acquire LVGL lock");
+    }
+}
+
+void enter_idle(void) {
+    if (lvgl_port_lock(0)) {
+        rgb_tile_idle();
+        lvgl_port_unlock();
+    } else {
+        ESP_LOGW(TAG, "enter_idle: could not acquire LVGL lock");
+    }
+}
+
+/* Sticky across calls: bsp_qmi8658_read_data() only actually has a fresh
+ * sample some of the time (gated by the sensor's own data-ready status
+ * bits), and returns false the rest -- if we reported "not upside-down" on
+ * every such call instead of holding the last known reading, a boot-time
+ * "held upside-down for N seconds" poll (see Main.swift) could flicker and
+ * never accumulate a continuous streak. */
+static bool s_last_upside_down = false;
+
+bool qmi8658_is_upside_down(void)
+{
+    qmi8658_data_t data;
+    if (bsp_qmi8658_read_data(&data)) {
+        printf("Z: %d\n", data.acc_z);
+        // Verified against a real unit: resting upside-down settles to
+        // roughly +8199 raw (~+1g at this driver's fixed +-4g range), so
+        // face-up must settle to roughly -8192 -- the opposite of this
+        // function's first guess. +4096 (half of 1g's raw magnitude) sits
+        // well clear of noise/tilt near the on-edge case rather than right
+        // at the boundary.
+        s_last_upside_down = data.acc_z > 4096;
+    }
+    return s_last_upside_down;
+}
+
 void initialize(void)
 {
     bsp_pwr_init();
@@ -68,6 +130,11 @@ void initialize(void)
     bsp_battery_init();
     bsp_display_init(&io_handle, &panel_handle, EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT);
     ESP_ERROR_CHECK(app_lvgl_init());
+
+    // Accelerometer -- currently only used for the "held upside-down at
+    // boot" pairing-reset gesture (see Main.swift / qmi8658_is_upside_down()).
+    i2c_master_bus_handle_t i2c_bus_handle = bsp_i2c_init();
+    bsp_qmi8658_init(i2c_bus_handle);
 
     bsp_display_brightness_init();
     bsp_display_set_brightness(40);

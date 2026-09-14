@@ -14,6 +14,19 @@ void rgb_tile_init(lv_obj_t *parent);
  * Caller must hold the LVGL port lock (lvgl_port_lock). */
 void rgb_tile_show_qr(const char *text);
 
+/* Same as rgb_tile_show_qr(), but never auto-hides (no countdown label, no
+ * QR_VISIBLE_SECONDS timeout) -- for the pairing QR (see
+ * docs/ble-provisioning.md), which needs to stay up for as long as the
+ * pairing window is open, not a fixed short display time. Caller must hold
+ * the LVGL port lock (lvgl_port_lock). */
+void rgb_tile_show_qr_persistent(const char *text);
+
+/* A plain, persistent, centered/wrapped text screen -- see
+ * rgb_tile_show_qr_persistent()'s docs/ble-provisioning.md reference; this
+ * is that flow's "scan this in <app>" helper text, alternated with the QR
+ * from Swift. Caller must hold the LVGL port lock (lvgl_port_lock). */
+void rgb_tile_show_message(const char *text);
+
 /* Ambient particle idle effect. Which effect actually runs (starfield, or
  * anything added later) is decided entirely on the Swift side -- see
  * particle.h's particle_effect_tick() and main/ParticleEffects.swift.
@@ -21,6 +34,11 @@ void rgb_tile_show_qr(const char *text);
  * it kicked off. Caller must hold the LVGL port lock (lvgl_port_lock). */
 void rgb_tile_show_particles(void);
 void rgb_tile_hide_particles(void);
+
+/* The command interface's Idle -- blank the tile and turn the backlight
+ * off, whichever of QR/particles/message was showing. Caller must hold the
+ * LVGL port lock (lvgl_port_lock). */
+void rgb_tile_idle(void);
 
 
 #ifdef __cplusplus

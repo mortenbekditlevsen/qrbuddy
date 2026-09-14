@@ -130,6 +130,10 @@ internal func _gap_callback(event: UnsafeMutablePointer<ble_gap_event>?, context
         // Central disconnected — advertising stopped when it connected, so
         // start it again or the device stays unreachable until a power cycle.
         restartAdvertising()
+        // Any pairing session (established or mid-handshake) only ever made
+        // sense for this specific connection (see Pairing.swift) — drop it
+        // rather than let a stale session key linger for a reused conn_handle.
+        pairingSessionOnDisconnect(connHandle: event.pointee.disconnect.conn.conn_handle)
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
         // Advertising ended on its own (shouldn't with BLE_HS_FOREVER, but be safe).

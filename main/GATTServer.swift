@@ -9,110 +9,99 @@
 //
 //===----------------------------------------------------------------------===//
 
+// Command interface: a single opcode+payload characteristic instead of a
+// fixed set of property characteristics (the previous design here) --
+// extending it later means adding a new opcode, never a new characteristic
+// or a client-side re-discovery. See docs/ble-provisioning.md for the wire
+// format. All command traffic rides the same authenticated/encrypted
+// session as everything else (Pairing.swift's pairingDecryptFromWire) --
+// there's deliberately no second, unauthenticated channel here.
+
 // MARK: - Service / Characteristic UUIDs
 
 let controlServiceUUIDString = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+private let commandUUIDString = "6E400011-B5A3-F393-E0A9-E50E24DCCA9E"
 
-private let propertyUUIDStrings: [String] = [
-    "6E400011-B5A3-F393-E0A9-E50E24DCCA9E",
-    "6E400012-B5A3-F393-E0A9-E50E24DCCA9E",
-    "6E400013-B5A3-F393-E0A9-E50E24DCCA9E",
-    "6E400014-B5A3-F393-E0A9-E50E24DCCA9E",
-    "6E400015-B5A3-F393-E0A9-E50E24DCCA9E",
-]
+private var commandHandle: UInt16 = 0
 
-private let propertyCount = propertyUUIDStrings.count
+// MARK: - Wire format (docs/ble-provisioning.md's command opcode table)
 
-/// Maximum stored length of each property's value, in bytes.
-/// Property 0 (`6E400011`) is a UTF-8 text buffer of up to 256 bytes; the
-/// others are fixed 4-byte values.
-private let propertyMaxLength: [Int] = [256, 4, 4, 4, 4]
+/// Append-only: a shipped opcode's meaning never changes or gets reused --
+/// deprecate by leaving it unused, not by reassigning the value. Payload
+/// shape is per-opcode (whatever's left in the decrypted plaintext after
+/// the opcode byte), not a single global layout.
+private enum Command {
+    case showQR(text: String)
+    case idle
+    case demoEffects
 
-/// Whether a property's payload is treated as UTF-8 text (validated on write,
-/// readable as a `String`) rather than a fixed 4-byte value.
-private func isTextProperty(_ index: Int) -> Bool { index == 0 }
-
-// MARK: - Persistent State
-
-/// Current value of each property. Only ever touched from Swift (never aliased
-/// by a raw pointer handed to C), so a plain array is safe here. Text properties
-/// start empty; fixed properties start as 4 zero bytes.
-private var propertyStorage: [[UInt8]] = (0 ..< propertyCount).map { index in
-    isTextProperty(index) ? [] : [0, 0, 0, 0]
+    static func parse(_ bytes: [UInt8]) -> Command? {
+        guard let opcode = bytes.first else { return nil }
+        let payload = Array(bytes.dropFirst())
+        switch opcode {
+        case 0x01:
+            guard let text = String(validating: payload, as: UTF8.self), !text.isEmpty else { return nil }
+            return .showQR(text: text)
+        case 0x02:
+            guard payload.isEmpty else { return nil }
+            return .idle
+        case 0x03:
+            guard payload.isEmpty else { return nil }
+            return .demoEffects
+        default:
+            return nil   // unknown opcode -- caller returns an ATT error, no app-level Nack needed
+        }
+    }
 }
 
-/// Attribute handles NimBLE assigns to each characteristic's value at registration time.
-/// Allocated as raw storage (not a Swift Array) because `ble_gatt_chr_def.val_handle`
-/// keeps a pointer into this for as long as the service is registered — a Swift Array's
-/// backing storage isn't guaranteed to stay at a fixed address the way this is.
-private let propertyHandles = UnsafeMutablePointer<UInt16>.allocate(capacity: propertyCount)
-
-// MARK: - Synchronization
-
-/// `propertyStorage` is touched from two tasks: NimBLE's host task (via
-/// `property_access_cb`, on every BLE read/write) and whichever task calls
-/// `updatePropertyValue` (here, app_main's loop). This brackets access with a
-/// scheduler suspend/resume — coarse, but the critical section is a 4-byte
-/// copy, so the window is negligible. `vTaskSuspendAll`/`xTaskResumeAll` are
-/// real functions (unlike the `xSemaphore*` family, which are macros and
-/// can't be bridged without a small C shim).
-@inline(__always)
-private func withPropertyLock<R>(_ body: () -> R) -> R {
-    vTaskSuspendAll()
-    defer { xTaskResumeAll() }
-    return body()
+private func handle(_ command: Command) {
+    switch command {
+    case .showQR(let text):
+        text.withCString { show_qr($0) }
+    case .idle:
+        enter_idle()
+    case .demoEffects:
+        show_particles()
+    }
 }
 
 // MARK: - Access Callback
 
-/// Shared access callback for all 5 property characteristics. NimBLE passes back
-/// whichever `arg` pointer was registered for the characteristic being accessed,
-/// which is how we recover which of the 5 properties this call is for.
-@_cdecl("property_access_cb")
-func property_access_cb(
+/// Write-only (no read, no notify) -- commands are fire-and-forget, per
+/// docs/ble-provisioning.md; a malformed/unknown one still gets a normal
+/// ATT-level write-response error (standard GATT behavior, not an
+/// app-level acknowledgement scheme).
+@_cdecl("command_access_cb")
+func command_access_cb(
     connHandle: UInt16,
     attrHandle: UInt16,
     ctxt: UnsafeMutablePointer<ble_gatt_access_ctxt>?,
     arg: UnsafeMutableRawPointer?
 ) -> Int32 {
-    guard let ctxt, let arg else { return 1 }
-    let index = arg.load(as: Int.self)
-    guard index >= 0, index < propertyCount else { return 1 }
+    guard let ctxt else { return 1 }
+    guard ctxt.pointee.op == UInt8(BLE_GATT_ACCESS_OP_WRITE_CHR) else { return 1 }
 
-    switch ctxt.pointee.op {
-    case UInt8(BLE_GATT_ACCESS_OP_READ_CHR):
-        let value = withPropertyLock { propertyStorage[index] }
-        let result = value.withUnsafeBytes { buf in
-            r_os_mbuf_append(ctxt.pointee.om, buf.baseAddress, UInt16(buf.count))
-        }
-        return result == 0 ? 0 : Int32(BLE_ATT_ERR_INSUFFICIENT_RES)
-
-    case UInt8(BLE_GATT_ACCESS_OP_WRITE_CHR):
-        // Flatten the incoming mbuf into a buffer sized to this property's max.
-        // ble_hs_mbuf_to_flat fails (BLE_HS_EMSGSIZE) if the write is larger,
-        // which is how the 256-byte / 4-byte caps are enforced.
-        var buffer = [UInt8](repeating: 0, count: propertyMaxLength[index])
-        var writtenLen: UInt16 = 0
-        let result = buffer.withUnsafeMutableBytes { buf in
-            ble_hs_mbuf_to_flat(ctxt.pointee.om, buf.baseAddress, UInt16(buf.count), &writtenLen)
-        }
-        guard result == 0 else { return Int32(BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN) }
-
-        let value = Array(buffer[..<Int(writtenLen)])
-        if isTextProperty(index) {
-            // Reject payloads that aren't well-formed UTF-8.
-            guard String(validating: value, as: UTF8.self) != nil else {
-                return Int32(BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN)
-            }
-        } else {
-            guard writtenLen == 4 else { return Int32(BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN) }
-        }
-        withPropertyLock { propertyStorage[index] = value }
-        return 0
-
-    default:
-        return 1
+    // Opcode + a generously-sized payload (the longest today is ShowQR's
+    // text) plus the encryption envelope's 20-byte overhead (4-byte counter
+    // + 16-byte tag).
+    var buffer = [UInt8](repeating: 0, count: 1 + 256 + 20)
+    var writtenLen: UInt16 = 0
+    let result = buffer.withUnsafeMutableBytes { buf in
+        ble_hs_mbuf_to_flat(ctxt.pointee.om, buf.baseAddress, UInt16(buf.count), &writtenLen)
     }
+    guard result == 0 else { return Int32(BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN) }
+
+    guard let plaintext = pairingDecryptFromWire(connHandle: connHandle, wire: Array(buffer[..<Int(writtenLen)])) else {
+        // No session, malformed envelope, or a bad auth tag -- drop it
+        // rather than reporting exactly which check failed.
+        return Int32(BLE_ATT_ERR_INSUFFICIENT_AUTHEN)
+    }
+    guard let command = Command.parse(plaintext) else {
+        return Int32(BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN)
+    }
+
+    handle(command)
+    return 0
 }
 
 // MARK: - Registration
@@ -120,26 +109,19 @@ func property_access_cb(
 /// Builds and registers the control service with NimBLE's GATT server.
 /// Call this after `NimBLE()` init and before `bluetooth.gap.startAdvertising()`.
 func setupGATTServer() throws(NimBLEError) {
-    // `arg` pointers handed to NimBLE — allocated once, read-only after this point,
-    // so a local allocation is fine (the underlying heap memory outlives this scope).
-    let argStorage = UnsafeMutablePointer<Int>.allocate(capacity: propertyCount)
+    let characteristics = UnsafeMutablePointer<ble_gatt_chr_def>.allocate(capacity: 2)
 
-    let characteristics = UnsafeMutablePointer<ble_gatt_chr_def>.allocate(capacity: propertyCount + 1)
-
-    for i in 0 ..< propertyCount {
-        argStorage[i] = i
-        characteristics[i] = ble_gatt_chr_def(
-            uuid: makeNimBLEUUID(propertyUUIDStrings[i]),
-            access_cb: property_access_cb,
-            arg: UnsafeMutableRawPointer(argStorage + i),
-            descriptors: nil,
-            flags: ble_gatt_chr_flags(BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY),
-            min_key_size: 0,
-            val_handle: propertyHandles + i,
-            cpfd: nil
-        )
-    }
-    characteristics[propertyCount] = ble_gatt_chr_def()   // zeroed sentinel (uuid == nil)
+    characteristics[0] = ble_gatt_chr_def(
+        uuid: makeNimBLEUUID(commandUUIDString),
+        access_cb: command_access_cb,
+        arg: nil,
+        descriptors: nil,
+        flags: ble_gatt_chr_flags(BLE_GATT_CHR_F_WRITE),
+        min_key_size: 0,
+        val_handle: &commandHandle,
+        cpfd: nil
+    )
+    characteristics[1] = ble_gatt_chr_def()   // zeroed sentinel (uuid == nil)
 
     let services = UnsafeMutablePointer<ble_gatt_svc_def>.allocate(capacity: 2)
     services[0] = ble_gatt_svc_def(
@@ -152,41 +134,12 @@ func setupGATTServer() throws(NimBLEError) {
 
     try ble_gatts_count_cfg(services).throwsError()
     try ble_gatts_add_svcs(services).throwsError()
+
+    // Provisioning's characteristics (see Pairing.swift) must also be added
+    // before ble_gatts_start() -- NimBLE wants every service registered
+    // (count_cfg + add_svcs) up front, with start() called exactly once
+    // after all of them.
+    try registerPairingService()
+
     try ble_gatts_start().throwsError()
-}
-
-// MARK: - Firmware-side reads
-
-/// Call from firmware logic to read the current value of a property —
-/// e.g. after a central has written to it over BLE.
-func readPropertyValue(index: Int) -> [UInt8] {
-    precondition(index >= 0 && index < propertyCount)
-    return withPropertyLock { propertyStorage[index] }
-}
-
-/// Read a text property's current value as a `String`. The stored bytes are
-/// always valid UTF-8 (enforced on every write), so decoding can't fail.
-func readPropertyString(index: Int) -> String {
-    precondition(isTextProperty(index), "Property \(index) is not a text property")
-    return String(decoding: readPropertyValue(index: index), as: UTF8.self)
-}
-
-// MARK: - Firmware-side updates
-
-/// Call from firmware logic (not from a BLE write) to change a property's value
-/// and notify any subscribed centrals.
-func updatePropertyValue(index: Int, value: [UInt8]) {
-    precondition(index >= 0 && index < propertyCount)
-    precondition(value.count <= propertyMaxLength[index],
-                 "Property \(index) holds at most \(propertyMaxLength[index]) bytes")
-    precondition(isTextProperty(index) || value.count == 4,
-                 "Fixed properties are exactly 4 bytes")
-    withPropertyLock { propertyStorage[index] = value }
-    ble_gatts_chr_updated(propertyHandles[index])
-}
-
-/// Set a text property from a `String` and notify subscribed centrals.
-func updatePropertyString(index: Int, value: String) {
-    precondition(isTextProperty(index), "Property \(index) is not a text property")
-    updatePropertyValue(index: index, value: Array(value.utf8))
 }

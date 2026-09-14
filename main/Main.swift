@@ -9,10 +9,83 @@
 //
 //===----------------------------------------------------------------------===//
 
+/// The buttons on this unit are hard to physically reach, so re-pairing is
+/// triggered by a held gesture instead: hold the unit upside-down while
+/// powering it up. Checked once at boot, before anything BLE-related, so it
+/// works independent of whether pairing/advertising even come up
+/// successfully. Exits immediately (no delay) if the unit isn't upside-down
+/// the very first time it checks -- this only costs boot time when the
+/// gesture is actually being performed.
+private func checkUpsideDownPairingReset() {
+    let pollIntervalTicks: UInt32 = 10   // 100ms at CONFIG_FREERTOS_HZ=100
+    let requiredGoodPolls = 50           // 50 * 100ms = 5s of (tolerantly) continuous upside-down
+    let maxBadStreak = 3                 // ~300ms of consecutive contrary readings before giving up
+
+    // Physically flipping the device by hand adds real rotational/dynamic
+    // acceleration on top of gravity, easily enough to briefly saturate the
+    // accelerometer's +-4g range right as the flip happens (a genuine
+    // reading, not sensor noise -- confirmed on a real unit: one flip
+    // produced a saturated -32768 sample before settling). Aborting on the
+    // very first non-matching sample would make the gesture fail on nearly
+    // every real attempt, so a short streak of contrary readings is
+    // tolerated (without resetting the accumulated good time) rather than
+    // treated as "gesture abandoned."
+    var goodPolls = 0
+    var badStreak = 0
+    while goodPolls < requiredGoodPolls {
+        if qmi8658_is_upside_down() {
+            goodPolls += 1
+            badStreak = 0
+        } else {
+            badStreak += 1
+            guard badStreak < maxBadStreak else { return }   // exits with no delay on the very first check
+        }
+        vTaskDelay(pollIntervalTicks)
+    }
+
+    // Held upside-down for the full 5 seconds -- clear the stored trust and
+    // let the normal startup path (pairingStartupCheck(), called once the
+    // BLE address is available below) notice there's none and open a fresh
+    // pairing window / show its QR, rather than duplicating that here.
+    print("Held upside-down for 5s at boot -- resetting pairing")
+    pairing_clear_trust()
+}
+
+// MARK: - Pairing screen alternation
+
+// While a pairing window is open, the display alternates between the QR
+// and a plain-language helper screen every few seconds, rather than
+// leaving the QR up indefinitely with no context for what it's for.
+private var pairingQRPayload: String?
+private var pairingAlternateShowingQR = true
+private var pairingAlternateTicksElapsed: UInt32 = 0
+private let pairingAlternateIntervalTicks: UInt32 = 500   // 5s at 10ms/tick
+private let pairingHelperText = "Scan the code in Ka-ching POS to pair"
+
+/// Called every main-loop tick (~10ms). A no-op once pairingQRPayload is
+/// nil (nothing to alternate) or the window has closed (paired, timed out,
+/// or locked out) -- pairingTick()/handleClientConfirm already put the
+/// right thing back on screen in those cases, this just stops interfering.
+private func pairingAlternateTick() {
+    guard pairingQRPayload != nil, pairing_window_is_open() else { return }
+
+    pairingAlternateTicksElapsed += 1
+    guard pairingAlternateTicksElapsed >= pairingAlternateIntervalTicks else { return }
+    pairingAlternateTicksElapsed = 0
+
+    pairingAlternateShowingQR.toggle()
+    if pairingAlternateShowingQR {
+        pairingQRPayload?.withCString { show_qr_persistent($0) }
+    } else {
+        pairingHelperText.withCString { show_message_persistent($0) }
+    }
+}
+
 @_cdecl("app_main")
 func app_main() {
     print("Hello from Swift on ESP32-C6!")
     initialize()
+    checkUpsideDownPairingReset()
 
     var bluetooth: NimBLE
     do {
@@ -30,6 +103,19 @@ func app_main() {
         // register the control service — must happen before advertising starts
         try setupGATTServer()
         print("GATT server registered")
+
+        // First boot ever (or right after a re-pair reset): no trusted
+        // client stored, so show the pairing QR immediately instead of the
+        // usual idle particle effect. See docs/ble-provisioning.md.
+        if let pop = pairingStartupCheck() {
+            let name = "Ka-ching " + address.description
+            let payload = "{\"v\":1,\"name\":\"\(name)\",\"svc\":\"\(controlServiceUUIDString)\",\"pop\":\"\(pop)\"}"
+            print("Awaiting pairing. POP: \(pop)")
+            pairingQRPayload = payload
+            pairingAlternateShowingQR = true
+            pairingAlternateTicksElapsed = 0
+            payload.withCString { show_qr_persistent($0) }
+        }
 
         // Advertise the control service UUID so a central (e.g. an iOS app doing
         // scanForPeripherals(withServices:)) can discover and filter for us.
@@ -64,46 +150,12 @@ func app_main() {
         print("Bluetooth error \(error.rawValue)")
     }
 
-    // Seed from current storage so we don't report a spurious change on boot.
-    var lastSeenValues: [[UInt8]] = (0..<5).map { readPropertyValue(index: $0) }
-
     while true {
-        for index in 0..<5 {
-            let current = readPropertyValue(index: index)
-            if current != lastSeenValues[index] {
-                if index == 0 {
-                    // Property 6E400011 is the UTF-8 URL to encode.
-                    let url = String(decoding: current, as: UTF8.self)
-                    guard !url.isEmpty else { continue }
-                    print("Property 0 changed, showing QR for: \(url)")
-                    url.withCString { show_qr($0) }
-                } else {
-                    print("Property \(index) changed to \(current)")
-                }
-                if index == 2 {
-                    // switch current[0] {
-                    //     case 0:
-                    //       state = .stopped
-                    //     case 1:
-                    //       state = .singleStep
-                    //       updatePropertyValue(index: 2, value: [0, 0, 0, 0])
-
-                    //       case 2:
-                    //       state = .homing
-
-                    //       case 3:
-                    //       state = .cycling
-
-                    //     default:
-                    //       ()
-
-                    // }
-                    //                    led.setLed(value: current[0] == 0)
-                }
-
-                lastSeenValues[index] = current
-            }
-        }
+        // Expires a stale pairing window (docs/ble-provisioning.md §7) --
+        // cheap (a timer comparison), fine to call every loop tick rather
+        // than throttling it separately.
+        pairingTick()
+        pairingAlternateTick()
 
         // ets_delay_us is a busy-wait (it spins on a cycle counter, never
         // yielding to the scheduler) -- using it to pace this loop meant the
