@@ -60,7 +60,7 @@ private var pairingQRPayload: String?
 private var pairingAlternateShowingQR = true
 private var pairingAlternateTicksElapsed: UInt32 = 0
 private let pairingAlternateIntervalTicks: UInt32 = 500   // 5s at 10ms/tick
-private let pairingHelperText = "Scan the code in Ka-ching POS to pair"
+private let pairingHelperText = "Scan the code under Settings -> CFDs in Ka-ching POS to pair"
 
 /// Called every main-loop tick (~10ms). A no-op once pairingQRPayload is
 /// nil (nothing to alternate) or the window has closed (paired, timed out,

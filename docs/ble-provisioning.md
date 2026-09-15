@@ -163,17 +163,42 @@ only; there's no device → app direction on this characteristic.
 
 | Opcode | Name | Payload |
 |---|---|---|
-| `0x01` | ShowQR | UTF-8 text to encode (variable length, non-empty) |
+| `0x01` | ShowQR | `display_seconds`(2, little-endian) `purpose`(1) `text`(UTF-8, variable length, non-empty) |
 | `0x02` | Idle | *(empty)* — backlight off, blank the tile |
 | `0x03` | DemoEffects | *(empty)* — run the particle idle-effect cycle |
 
+**ShowQR's fields:**
+- `display_seconds`: how long the QR (and its progress bar) stays up before
+  auto-hiding. `0` means *don't* time out — no auto-hide, and no progress
+  bar shown at all (same behavior the pairing QR already uses internally).
+- `purpose`: a single-byte enum. A small pictogram is drawn to the right of
+  the code for it (32x32px, in the horizontal space freed up by
+  left-aligning the code instead of centering it whenever a purpose is
+  set — the pairing/demo QRs, which never set one, stay centered with no
+  icon, unaffected) — so far only for Receipt and MobilePay; every other
+  value below is communicated but still just leaves that area blank until
+  it gets an icon too:
+
+  | Value | Meaning | Icon |
+  |---|---|---|
+  | `0x00` | Receipt | ✅ |
+  | `0x01` | MobilePay | ✅ |
+  | `0x02` | AccountPay | — |
+  | `0x03` | GiftCard | — |
+  | `0x04` | LoyaltyCard | — |
+  | `0x05` | Coupon | — |
+  | `0x06` | MembershipSignup | — |
+
+  An unrecognized value is rejected the same as a malformed opcode (a
+  normal ATT write-response error), not silently defaulted.
+
 Extending this: append a new opcode value, never renumber or reuse one
-already shipped (deprecate by leaving it unused). A device that doesn't
-recognize an opcode, or gets a payload that doesn't match what that opcode
-expects, returns a normal ATT write-response error — there's no
-application-level acknowledgement on success (decided not needed for this
-product; add a `CMD_STATUS` read+notify characteristic later if that
-changes).
+already shipped (deprecate by leaving it unused). Same rule for `purpose`'s
+values. A device that doesn't recognize an opcode, or gets a payload that
+doesn't match what that opcode expects, returns a normal ATT write-response
+error — there's no application-level acknowledgement on success (decided
+not needed for this product; add a `CMD_STATUS` read+notify characteristic
+later if that changes).
 
 `client_id` is 16 random bytes the app generates once at first pairing and
 reuses on every future resume — it's just a lookup key, not a secret.

@@ -21,6 +21,16 @@ void rgb_tile_show_qr(const char *text);
  * the LVGL port lock (lvgl_port_lock). */
 void rgb_tile_show_qr_persistent(const char *text);
 
+/* Like rgb_tile_show_qr(), but with a caller-chosen display duration
+ * instead of the fixed QR_VISIBLE_SECONDS -- the command interface's
+ * ShowQR (see docs/ble-provisioning.md §5b). `display_seconds <= 0` means
+ * "don't time out" (same as rgb_tile_show_qr_persistent(), including no
+ * progress bar). `purpose` is stored but not yet used for anything visual
+ * -- plumbed through now so the wire format doesn't need to change again
+ * once it is (see docs/ble-provisioning.md's ShowQR purpose enum). Caller
+ * must hold the LVGL port lock (lvgl_port_lock). */
+void rgb_tile_show_qr_timed(const char *text, int32_t display_seconds, uint8_t purpose);
+
 /* A plain, persistent, centered/wrapped text screen -- see
  * rgb_tile_show_qr_persistent()'s docs/ble-provisioning.md reference; this
  * is that flow's "scan this in <app>" helper text, alternated with the QR

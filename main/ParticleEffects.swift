@@ -96,7 +96,6 @@ private var previousEffect: CurrentParticleEffect?   // kept "alive" (still tick
 // Remove this block once you've settled on how effects should actually switch.
 private let ticksPerEffect: Int32 = 5 * 20  // 5s * 20 Hz
 private var ticksUntilSwitch: Int32 = ticksPerEffect
-private let testURL = "https://ka-ching.dk"
 
 // Crossfade from the particle-formed QR silhouette to the real, fully-
 // detailed solid QR (rgb_tile.c's existing renderer) once the particles have
@@ -112,8 +111,8 @@ private enum QRCrossfade: Equatable {
     case faded
 }
 private var qrCrossfade: QRCrossfade = .none
-private let qrFadeDuration: Float = 0.5   // seconds
-private let qrFadeLeadTicks = Int32((0.5 / 0.05).rounded())  // start fading out this many ticks before the scheduled switch
+private let qrFadeDuration: Float = 0.3   // seconds
+private let qrFadeLeadTicks = Int32((0.25 / 0.05).rounded())  // start fading out this many ticks before the scheduled switch
 private let qrEarlyFadeLead: Float = 0.25  // start solidifying this long before the skeleton would otherwise finish settling
 
 // MARK: - Physics tuning (ported from the JS prototype's constants)
@@ -286,7 +285,13 @@ func particle_effect_tick(
         switch currentEffect {
         case .starfield: currentEffect = .sphere(Sphere())
         case .sphere:    currentEffect = .cube(Cube())
-        case .cube:      currentEffect = .qr(testURL)
+        case .cube:      currentEffect = .starfield(Starfield())
+        // .qr is no longer part of the DemoEffects auto-cycle (dropped per
+        // request) -- kept here only for CurrentParticleEffect's switch
+        // exhaustiveness. Currently unreachable: nothing else switches
+        // *into* .qr anymore, so all the crossfade/skeleton machinery below
+        // that exists for it is dead code for now, not deleted in case it
+        // gets wired up some other way later (e.g. its own command).
         case .qr:        currentEffect = .starfield(Starfield())
         }
         qrCrossfade = .none
@@ -786,7 +791,10 @@ private func qrTargets(tileW: Int32, tileH: Int32, into out: inout [SlotTarget])
     let cellPx = Float(particle_qr_px_per_module(tileW, tileH))
     let qrPx = Float(modules) * cellPx
     let originX = (Float(tileW) - qrPx) / 2
-    let originY = (Float(tileH) - qrPx) / 2
+    // Matches draw_qr's own top-aligned vertical placement (rgb_tile.c) --
+    // flush to the tile's top edge, quiet-zone margin and all, rather than
+    // centered, so the crossfade lines up with what it settles into.
+    let originY = Float(QR_LAYOUT_QUIET_MODULES) * cellPx
     let dotSize = cellPx * 1.1
 
     // modules = 4*version + 17 exactly, for every version -- integer

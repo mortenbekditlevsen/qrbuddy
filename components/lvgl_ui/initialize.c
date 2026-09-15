@@ -64,6 +64,15 @@ void show_qr_persistent(const char * text) {
     }
 }
 
+void show_qr_timed(const char * text, int32_t display_seconds, uint8_t purpose) {
+    if (lvgl_port_lock(0)) {
+        rgb_tile_show_qr_timed(text, display_seconds, purpose);
+        lvgl_port_unlock();
+    } else {
+        ESP_LOGW(TAG, "show_qr_timed: could not acquire LVGL lock");
+    }
+}
+
 void show_message_persistent(const char * text) {
     if (lvgl_port_lock(0)) {
         rgb_tile_show_message(text);
@@ -103,7 +112,6 @@ bool qmi8658_is_upside_down(void)
 {
     qmi8658_data_t data;
     if (bsp_qmi8658_read_data(&data)) {
-        printf("Z: %d\n", data.acc_z);
         // Verified against a real unit: resting upside-down settles to
         // roughly +8199 raw (~+1g at this driver's fixed +-4g range), so
         // face-up must settle to roughly -8192 -- the opposite of this
