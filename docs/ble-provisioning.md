@@ -171,23 +171,19 @@ only; there's no device → app direction on this characteristic.
 - `display_seconds`: how long the QR (and its progress bar) stays up before
   auto-hiding. `0` means *don't* time out — no auto-hide, and no progress
   bar shown at all (same behavior the pairing QR already uses internally).
-- `purpose`: a single-byte enum. A small pictogram is drawn to the right of
-  the code for it (32x32px, in the horizontal space freed up by
-  left-aligning the code instead of centering it whenever a purpose is
-  set — the pairing/demo QRs, which never set one, stay centered with no
-  icon, unaffected) — so far only for Receipt and MobilePay; every other
-  value below is communicated but still just leaves that area blank until
-  it gets an icon too:
+- `purpose`: a single-byte enum, communicated now but not yet acted on (no
+  text/symbol shown for it yet — reserved for a later UI addition so the
+  wire format doesn't need to change again once there is one):
 
-  | Value | Meaning | Icon |
-  |---|---|---|
-  | `0x00` | Receipt | ✅ |
-  | `0x01` | MobilePay | ✅ |
-  | `0x02` | AccountPay | — |
-  | `0x03` | GiftCard | — |
-  | `0x04` | LoyaltyCard | — |
-  | `0x05` | Coupon | — |
-  | `0x06` | MembershipSignup | — |
+  | Value | Meaning |
+  |---|---|
+  | `0x00` | Receipt |
+  | `0x01` | MobilePay |
+  | `0x02` | AccountPay |
+  | `0x03` | GiftCard |
+  | `0x04` | LoyaltyCard |
+  | `0x05` | Coupon |
+  | `0x06` | MembershipSignup |
 
   An unrecognized value is rejected the same as a malformed opcode (a
   normal ATT write-response error), not silently defaulted.

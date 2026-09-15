@@ -17,16 +17,6 @@
 #define QR_MIN_VERSION   1
 #define QR_MAX_VERSION   10
 
-// Purpose icon (see docs/ble-provisioning.md's ShowQR `purpose` field):
-// a small pictogram to the right of the code, in the space freed up by
-// left- instead of center-aligning the code horizontally. QR_PURPOSE_NONE
-// is a sentinel distinct from every real purpose byte (0x00-0x06 today) --
-// draw_qr() only left-aligns (and draw_purpose_icon() only draws anything)
-// when qr_purpose is a real value, so the pairing/demo QRs (which never set
-// a purpose) stay centered exactly as before.
-#define QR_PURPOSE_NONE  0xFF
-#define QR_PURPOSE_ICON_SIZE 32
-
 // Generic particle-effect rendering. This file has no idea which effect is
 // running (starfield, sphere, flock, ...) -- that's entirely decided in Swift
 // (see main/ParticleEffects.swift). Each tick we ask Swift to fill
@@ -38,7 +28,7 @@
 static uint8_t qr_buf[177][177]; // 177 = max modules at version 40
 static int qr_modules = 0;
 static bool qr_visible = false;        // whether draw_qr should paint anything (the "real", BLE-triggered display)
-static uint8_t qr_purpose = QR_PURPOSE_NONE;   // set by rgb_tile_show_qr_timed(); QR_PURPOSE_NONE elsewhere
+static uint8_t qr_purpose = 0;         // set by rgb_tile_show_qr_timed(); not yet used for anything visual (see rgb_tile.h)
 
 // Solid-QR overlay for the particle effect's QR case: once its particles
 // settle into the silhouette, Swift crossfades this in on top (reusing the
@@ -118,47 +108,6 @@ int32_t particle_qr_px_per_module(int32_t tile_w, int32_t tile_h)
     return qr_fit_px_per_module(qr_modules, tile_w, tile_h);
 }
 
-/* Everything draw_qr() and draw_purpose_icon() both need to agree on pixel-
- * for-pixel -- computed once so the icon can never drift out of sync with
- * where the code it's supposed to sit next to actually lands. */
-typedef struct {
-    int32_t px_per_module;
-    int32_t qr_px;      // code-only size (no quiet zone)
-    int32_t quiet_px;
-    int32_t origin_x;   // the code's own top-left corner (not the quiet zone's)
-    int32_t origin_y;
-} qr_layout_t;
-
-static qr_layout_t compute_qr_layout(const lv_area_t *obj_coords)
-{
-    qr_layout_t L;
-    int32_t obj_w = lv_area_get_width(obj_coords);
-    int32_t obj_h = lv_area_get_height(obj_coords);
-    L.px_per_module = qr_fit_px_per_module(qr_modules, obj_w, obj_h);
-    L.qr_px = qr_modules * L.px_per_module;
-    L.quiet_px = QR_LAYOUT_QUIET_MODULES * L.px_per_module;
-
-    // Flush to the top vertically always (origin_y is exactly quiet_px down
-    // from the tile's own top edge -- the white quiet-zone border's top
-    // edge sits flush at y1, no extra margin above it), which leaves every
-    // bit of *vertical* leftover space below the code for the progress bar
-    // (qr_progress_bar) instead of splitting it above+below where the bar
-    // can't use it.
-    //
-    // Horizontally: centered, UNLESS a purpose icon is being shown, in
-    // which case flush-left instead (same reasoning as vertical, but for
-    // the icon area on the right instead of the progress bar below) --
-    // gating this on qr_purpose keeps the pairing/demo QRs (which never
-    // set a purpose) centered exactly as before this feature existed.
-    if (qr_purpose != QR_PURPOSE_NONE) {
-        L.origin_x = obj_coords->x1 + L.quiet_px;
-    } else {
-        L.origin_x = obj_coords->x1 + (obj_w - L.qr_px) / 2;
-    }
-    L.origin_y = obj_coords->y1 + L.quiet_px;
-    return L;
-}
-
 /* Draws the fully-detailed, solid QR (border included) at `overlay_opa`
  * (0 = skip entirely, 255 = fully opaque). Used both for the "real"
  * BLE-triggered display (always LV_OPA_COVER) and, at a Swift-ramped partial
@@ -167,12 +116,20 @@ static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords, lv_opa_t ove
 {
     if (overlay_opa == LV_OPA_TRANSP || qr_modules <= 0) return;
 
-    qr_layout_t L = compute_qr_layout(obj_coords);
-    int32_t px_per_module = L.px_per_module;
-    int32_t qr_px = L.qr_px;
-    int32_t quiet_px = L.quiet_px;
-    int32_t origin_x = L.origin_x;
-    int32_t origin_y = L.origin_y;
+    int32_t obj_w = lv_area_get_width(obj_coords);
+    int32_t obj_h = lv_area_get_height(obj_coords);
+    int32_t px_per_module = qr_fit_px_per_module(qr_modules, obj_w, obj_h);
+    int32_t qr_px = qr_modules * px_per_module;
+    int32_t quiet_px = QR_LAYOUT_QUIET_MODULES * px_per_module;
+
+    // Centered horizontally; flush to the top vertically (origin_y is
+    // exactly quiet_px down from the tile's own top edge, i.e. the white
+    // quiet-zone border's top edge sits flush at y1, no extra margin above
+    // it) -- leaves every bit of this dimension's leftover space below the
+    // code for the progress bar (qr_progress_bar) instead of splitting it
+    // above+below where the bar can't use it.
+    int32_t origin_x = obj_coords->x1 + (obj_w - qr_px) / 2;
+    int32_t origin_y = obj_coords->y1 + quiet_px;
 
     lv_draw_rect_dsc_t bg_dsc;
     lv_draw_rect_dsc_init(&bg_dsc);
@@ -219,103 +176,6 @@ static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords, lv_opa_t ove
     }
 }
 
-/* Small pictogram to the right of the code for ShowQR's `purpose` field
- * (see docs/ble-provisioning.md) -- a no-op unless qr_purpose is a
- * recognized value (only Receipt and MobilePay have icons so far; every
- * other purpose byte just leaves the area blank, same as QR_PURPOSE_NONE,
- * until it gets one). Reuses compute_qr_layout() so it can never disagree
- * with draw_qr() about where the code's own right edge actually is.
- * Coordinates are simple fractions of QR_PURPOSE_ICON_SIZE rather than
- * hardcoded pixels, so resizing the icon later is a one-constant change. */
-static void draw_purpose_icon(lv_layer_t *layer, const lv_area_t *obj_coords)
-{
-    if (qr_purpose == QR_PURPOSE_NONE || qr_modules <= 0) return;
-
-    qr_layout_t L = compute_qr_layout(obj_coords);
-    int32_t obj_w = lv_area_get_width(obj_coords);
-    int32_t block_right = L.origin_x + L.qr_px + L.quiet_px;   // right edge of the white quiet-zone border
-    int32_t avail_w = (obj_coords->x1 + obj_w) - block_right;
-
-    const int32_t S = QR_PURPOSE_ICON_SIZE;
-    if (avail_w < S) return;   // shouldn't happen at any supported QR version, but never draw off/overlapping the code
-    int32_t icon_x = block_right + (avail_w - S) / 2;               // centered in the leftover width
-    int32_t icon_y = L.origin_y + L.qr_px / 2 - S / 2;               // centered on the code's own vertical middle
-
-    lv_draw_rect_dsc_t white;
-    lv_draw_rect_dsc_init(&white);
-    white.bg_color = lv_color_white();
-    white.bg_opa = LV_OPA_COVER;
-    white.border_width = 0;
-
-    lv_draw_rect_dsc_t black;
-    lv_draw_rect_dsc_init(&black);
-    black.bg_color = lv_color_black();
-    black.bg_opa = LV_OPA_COVER;
-    black.border_width = 0;
-
-    switch (qr_purpose) {
-    case 0x00: {   // Receipt: a white "paper" slip with a few printed-line bars
-        lv_area_t paper = {
-            .x1 = icon_x + S * 1 / 8, .y1 = icon_y + S * 1 / 16,
-            .x2 = icon_x + S * 7 / 8, .y2 = icon_y + S * 15 / 16,
-        };
-        white.radius = S / 16;
-        lv_draw_rect(layer, &white, &paper);
-
-        black.radius = 0;
-        for (int i = 0; i < 4; i++) {
-            int32_t line_y = paper.y1 + S * 3 / 16 + i * (S * 3 / 16);
-            bool shorter = (i == 3);   // "total" line, a bit shorter than the item lines above it
-            lv_area_t line = {
-                .x1 = paper.x1 + S * 1 / 8,
-                .y1 = line_y,
-                .x2 = shorter ? (paper.x1 + S * 4 / 8) : (paper.x2 - S * 1 / 8),
-                .y2 = line_y + S / 16,
-            };
-            lv_draw_rect(layer, &black, &line);
-        }
-        break;
-    }
-    case 0x01: {   // MobilePay: a phone silhouette with a coin/payment dot on its screen
-        lv_area_t phone = {
-            .x1 = icon_x + S * 2 / 8, .y1 = icon_y + S * 1 / 16,
-            .x2 = icon_x + S * 6 / 8, .y2 = icon_y + S * 15 / 16,
-        };
-        white.radius = S / 8;
-        lv_draw_rect(layer, &white, &phone);
-
-        lv_area_t screen = {
-            .x1 = phone.x1 + S / 16, .y1 = phone.y1 + S * 3 / 16,
-            .x2 = phone.x2 - S / 16, .y2 = phone.y2 - S * 3 / 16,
-        };
-        black.radius = S / 32;
-        lv_draw_rect(layer, &black, &screen);
-
-        int32_t coin_r = S / 8;
-        int32_t coin_cx = (screen.x1 + screen.x2) / 2;
-        int32_t coin_cy = (screen.y1 + screen.y2) / 2;
-        lv_area_t coin = {
-            .x1 = coin_cx - coin_r, .y1 = coin_cy - coin_r,
-            .x2 = coin_cx + coin_r, .y2 = coin_cy + coin_r,
-        };
-        white.radius = coin_r;   // radius >= half the box's width/height draws a circle, not just a rounded square
-        lv_draw_rect(layer, &white, &coin);
-
-        int32_t home_r = S / 24;
-        int32_t home_cy = phone.y2 - S / 16 - home_r;
-        lv_area_t home_button = {
-            .x1 = coin_cx - home_r, .y1 = home_cy - home_r,
-            .x2 = coin_cx + home_r, .y2 = home_cy + home_r,
-        };
-        black.radius = home_r;
-        lv_draw_rect(layer, &black, &home_button);
-        break;
-    }
-    default:
-        break;   // AccountPay/GiftCard/LoyaltyCard/Coupon/MembershipSignup -- no icon yet
-    }
-}
-
 /* Draws whatever Swift put in particle_buf last tick. Genuinely doesn't know
  * (and doesn't need to know) which effect produced it. */
 static void draw_particles(lv_layer_t *layer, const lv_area_t *obj_coords)
@@ -357,7 +217,6 @@ static void rgb_tile_draw_event_cb(lv_event_t * e)
 
     if (qr_visible) {
         draw_qr(layer, &obj_coords, LV_OPA_COVER);
-        draw_purpose_icon(layer, &obj_coords);   // only the "real" display ever has a purpose set -- see rgb_tile_show_qr()/_persistent()
     } else {
         if (particles_active) {
             draw_particles(layer, &obj_coords);
@@ -543,19 +402,17 @@ static void show_qr_internal(const char *text, int32_t display_seconds)
 
 void rgb_tile_show_qr(const char *text)
 {
-    qr_purpose = QR_PURPOSE_NONE;   // no purpose concept on this path -- stay centered, no icon
     show_qr_internal(text, QR_VISIBLE_SECONDS);
 }
 
 void rgb_tile_show_qr_persistent(const char *text)
 {
-    qr_purpose = QR_PURPOSE_NONE;   // ditto -- the pairing QR never carries a purpose
     show_qr_internal(text, 0);
 }
 
 void rgb_tile_show_qr_timed(const char *text, int32_t display_seconds, uint8_t purpose)
 {
-    qr_purpose = purpose;   // draw_qr()/draw_purpose_icon() left-align + draw the icon whenever this isn't QR_PURPOSE_NONE
+    qr_purpose = purpose;   // not yet used for anything visual -- see rgb_tile.h
     show_qr_internal(text, display_seconds);
 }
 
