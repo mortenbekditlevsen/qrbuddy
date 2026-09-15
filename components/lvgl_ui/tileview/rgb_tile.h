@@ -25,10 +25,11 @@ void rgb_tile_show_qr_persistent(const char *text);
  * instead of the fixed QR_VISIBLE_SECONDS -- the command interface's
  * ShowQR (see docs/ble-provisioning.md §5b). `display_seconds <= 0` means
  * "don't time out" (same as rgb_tile_show_qr_persistent(), including no
- * progress bar). `purpose` is stored but not yet used for anything visual
- * -- plumbed through now so the wire format doesn't need to change again
- * once it is (see docs/ble-provisioning.md's ShowQR purpose enum). Caller
- * must hold the LVGL port lock (lvgl_port_lock). */
+ * progress bar). `purpose` drives a short caption below the code, but only
+ * in portrait orientation, and only for the purposes that have one so far
+ * (see docs/ble-provisioning.md's ShowQR purpose table) -- every other
+ * value is accepted and stored but shows nothing yet. Caller must hold the
+ * LVGL port lock (lvgl_port_lock). */
 void rgb_tile_show_qr_timed(const char *text, int32_t display_seconds, uint8_t purpose);
 
 /* A plain, persistent, centered/wrapped text screen -- see

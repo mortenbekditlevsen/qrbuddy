@@ -39,6 +39,23 @@ private enum QRPurpose: UInt8 {
     case membershipSignup = 0x06
 }
 
+/// SetConfig's config-type byte -- selects which persisted setting a
+/// SetConfig write is for; the rest of the payload's shape depends on
+/// this, same relationship as opcode -> payload. Append-only, same rule
+/// as opcodes and QRPurpose.
+private enum ConfigType: UInt8 {
+    case orientation = 0x00
+}
+
+/// Mirrors device_config.h's DEVICE_ORIENTATION_* values exactly -- raw
+/// value is what gets passed to device_config_set_orientation().
+private enum DeviceOrientation: UInt8 {
+    case rotate0 = 0
+    case rotate90 = 1
+    case rotate180 = 2
+    case rotate270 = 3
+}
+
 /// Append-only: a shipped opcode's meaning never changes or gets reused --
 /// deprecate by leaving it unused, not by reassigning the value. Payload
 /// shape is per-opcode (whatever's left in the decrypted plaintext after
@@ -47,6 +64,8 @@ private enum Command {
     case showQR(text: String, displaySeconds: UInt16, purpose: QRPurpose)
     case idle
     case demoEffects
+    case setOrientation(DeviceOrientation)
+    case getConfig(ConfigType)
 
     static func parse(_ bytes: [UInt8]) -> Command? {
         guard let opcode = bytes.first else { return nil }
@@ -66,13 +85,26 @@ private enum Command {
         case 0x03:
             guard payload.isEmpty else { return nil }
             return .demoEffects
+        case 0x04:
+            // configType(1) + a value whose shape depends on configType.
+            guard payload.count >= 1, let configType = ConfigType(rawValue: payload[0]) else { return nil }
+            switch configType {
+            case .orientation:
+                guard payload.count == 2, let orientation = DeviceOrientation(rawValue: payload[1]) else { return nil }
+                return .setOrientation(orientation)
+            }
+        case 0x05:
+            // configType(1), no further payload -- the response (opcode
+            // 0x06, see sendConfigValue()) is what carries a value.
+            guard payload.count == 1, let configType = ConfigType(rawValue: payload[0]) else { return nil }
+            return .getConfig(configType)
         default:
             return nil   // unknown opcode -- caller returns an ATT error, no app-level Nack needed
         }
     }
 }
 
-private func handle(_ command: Command) {
+private func handle(_ command: Command, connHandle: UInt16) {
     switch command {
     case .showQR(let text, let displaySeconds, let purpose):
         // displaySeconds == 0 means "don't time out" -- rgb_tile_show_qr_timed()
@@ -83,15 +115,56 @@ private func handle(_ command: Command) {
         enter_idle()
     case .demoEffects:
         show_particles()
+    case .setOrientation(let orientation):
+        // Persist, then restart to apply -- this display stack doesn't
+        // support changing hardware rotation live (see device_config.h).
+        // device_config_set_orientation() only fails on an out-of-range
+        // raw value, which DeviceOrientation's own validation above
+        // already ruled out, so this is really just "persist, then
+        // restart" in practice.
+        if device_config_set_orientation(orientation.rawValue) {
+            device_config_schedule_restart()
+        }
+    case .getConfig(let configType):
+        // The one deliberate exception to "commands are fire-and-forget,
+        // no acknowledgement" (docs/ble-provisioning.md §5b) -- a read
+        // fundamentally needs something to read back. Response goes out
+        // as its own opcode (0x06, ConfigValue), encrypted the same as
+        // every other CMD payload, notified to exactly this connection --
+        // not the shared-value ble_gatts_chr_updated() path property
+        // characteristics used to have the documented limitation with.
+        switch configType {
+        case .orientation:
+            sendConfigValue(connHandle: connHandle, configType: .orientation, value: [device_config_get_orientation()])
+        }
+    }
+}
+
+/// Sends a ConfigValue (0x06) response to exactly `connHandle`, encrypted
+/// under its session key -- see handle(_:connHandle:)'s .getConfig case.
+/// Mirrors Pairing.swift's sendHandshakeResponse(), except that function's
+/// messages are deliberately *not* encrypted (no session exists yet during
+/// a handshake); this one always is, since GetConfig only ever happens
+/// after pairing.
+private func sendConfigValue(connHandle: UInt16, configType: ConfigType, value: [UInt8]) {
+    var plaintext: [UInt8] = [0x06, configType.rawValue]
+    plaintext.append(contentsOf: value)
+    guard let wire = pairingEncryptForWire(connHandle: connHandle, plaintext: plaintext) else { return }
+    wire.withUnsafeBytes { buf in
+        guard let om = ble_hs_mbuf_from_flat(buf.baseAddress, UInt16(buf.count)) else { return }
+        ble_gatts_notify_custom(connHandle, commandHandle, om)
     }
 }
 
 // MARK: - Access Callback
 
-/// Write-only (no read, no notify) -- commands are fire-and-forget, per
-/// docs/ble-provisioning.md; a malformed/unknown one still gets a normal
-/// ATT-level write-response error (standard GATT behavior, not an
-/// app-level acknowledgement scheme).
+/// Write + Notify. Every command is still fire-and-forget with no
+/// acknowledgement (docs/ble-provisioning.md §5b) *except* GetConfig
+/// (0x05), which notifies a ConfigValue (0x06) response back -- the one
+/// case where "no ack" doesn't apply, because the whole point is reading a
+/// value back, not just triggering an action. A malformed/unknown write
+/// still gets a normal ATT-level write-response error regardless (standard
+/// GATT behavior, not an app-level Nack).
 @_cdecl("command_access_cb")
 func command_access_cb(
     connHandle: UInt16,
@@ -121,7 +194,7 @@ func command_access_cb(
         return Int32(BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN)
     }
 
-    handle(command)
+    handle(command, connHandle: connHandle)
     return 0
 }
 
@@ -144,7 +217,7 @@ func setupGATTServer() throws(NimBLEError) {
         access_cb: command_access_cb,
         arg: nil,
         descriptors: nil,
-        flags: ble_gatt_chr_flags(BLE_GATT_CHR_F_WRITE),
+        flags: ble_gatt_chr_flags(BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_NOTIFY),
         min_key_size: 0,
         val_handle: &commandHandle,
         cpfd: nil

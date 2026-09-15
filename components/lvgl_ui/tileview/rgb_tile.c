@@ -8,6 +8,24 @@
 #define QR_VISIBLE_SECONDS 60  // how long the QR code stays on screen
 #define QR_BACKLIGHT     20    // backlight % while a QR code is on screen
 
+// QR_LAYOUT_TOP_MARGIN (particle.h -- shared with the, currently dead-code,
+// Swift particle skeleton so the two can't drift apart) is reserved
+// *inside* qr_fit_px_per_module()'s fit calculation below (not just added
+// to origin_y) so the block is guaranteed to still fit entirely within the
+// tile's short dimension with this margin on top, never pushing the
+// bottom edge past the tile.
+
+// qr_purpose sentinels distinct from every real purpose byte the BLE
+// ShowQR command can send (0x00-0x06, see docs/ble-provisioning.md) --
+// QR_PURPOSE_NONE for the plain/demo QR (rgb_tile_show_qr()), which has no
+// purpose concept at all, and QR_PURPOSE_PAIRING for the pairing flow's
+// own fixed caption. Keeping these as explicit sentinels (rather than,
+// say, leaving qr_purpose untouched on those paths) matters: without it, a
+// stale purpose from a previous ShowQR command would still be sitting in
+// qr_purpose and could wrongly caption a later plain/pairing QR.
+#define QR_PURPOSE_NONE    0xFF
+#define QR_PURPOSE_PAIRING 0xFE
+
 // The encoder is allowed to pick any version in this range -- it always
 // picks the smallest one the text (plus ECC) actually fits in, so short URLs
 // get a coarser, more scannable code and only long ones grow. Capped at 10
@@ -28,7 +46,7 @@
 static uint8_t qr_buf[177][177]; // 177 = max modules at version 40
 static int qr_modules = 0;
 static bool qr_visible = false;        // whether draw_qr should paint anything (the "real", BLE-triggered display)
-static uint8_t qr_purpose = 0;         // set by rgb_tile_show_qr_timed(); not yet used for anything visual (see rgb_tile.h)
+static uint8_t qr_purpose = QR_PURPOSE_NONE;   // set by whichever rgb_tile_show_qr*() was called last; drives the caption switch in show_qr_internal()
 
 // Solid-QR overlay for the particle effect's QR case: once its particles
 // settle into the silhouette, Swift crossfades this in on top (reusing the
@@ -43,6 +61,7 @@ static uint8_t particle_qr_overlay_opa = 0;
 static lv_obj_t *obj_rgb_tile;
 static lv_obj_t *qr_progress_bar;      // shrinks from full width as the QR's countdown runs out, hidden while no QR
 static lv_obj_t *pairing_message_label;   // pairing flow's "scan this" helper text, hidden otherwise
+static lv_obj_t *qr_purpose_label;     // ShowQR's per-purpose caption, portrait orientation only -- see show_qr_internal()
 static lv_timer_t *qr_tick_timer;      // 1 Hz countdown timer, paused while no QR
 static int qr_seconds_left;
 
@@ -56,15 +75,28 @@ static int32_t particle_tile_w = 280, particle_tile_h = 240; // set from the rea
 /* Single source of truth for "how many pixels is one module" -- used by
  * draw_qr() itself and exposed to Swift (particle_qr_px_per_module()) so the
  * particle skeleton lines up with whatever size the solid renderer actually
- * draws at. Fits `modules` (plus the quiet zone on both sides) into the
- * tile's *shorter* dimension, floor-divided -- floor rather than round so
- * the block never overflows. Floored to a minimum of 1px/module so a
- * pathological tiny tile still draws something instead of dividing to 0. */
+ * draws at. Fits `modules` (plus the quiet zone on both sides, plus
+ * QR_LAYOUT_TOP_MARGIN -- portrait only, see below) into the tile's
+ * *shorter* dimension, floor-divided -- floor rather than round so the
+ * block never overflows. Reserving the top margin *here* (not just added
+ * to origin_y separately) is what guarantees the block still fits
+ * entirely within the tile with that margin included, rather than pushing
+ * its bottom edge past the tile.
+ *
+ * The margin only applies in portrait (tile_h > tile_w): landscape's extra
+ * *horizontal* space already keeps the block clear of the screen's
+ * rounded corners without needing to shift it down too, so reserving the
+ * margin there as well would just shrink the code for no reason. Floored
+ * to a minimum of 1px/module so a pathological tiny tile still draws
+ * something instead of dividing to 0. */
 static int32_t qr_fit_px_per_module(int32_t modules, int32_t tile_w, int32_t tile_h)
 {
     if (modules <= 0) return 0;
     int32_t short_dim = tile_w < tile_h ? tile_w : tile_h;
-    int32_t px = short_dim / (modules + 2 * QR_LAYOUT_QUIET_MODULES);
+    int32_t margin = (tile_h > tile_w) ? QR_LAYOUT_TOP_MARGIN : 0;
+    int32_t available = short_dim - margin;
+    if (available < 1) available = 1;
+    int32_t px = available / (modules + 2 * QR_LAYOUT_QUIET_MODULES);
     return px < 1 ? 1 : px;
 }
 
@@ -122,14 +154,18 @@ static void draw_qr(lv_layer_t *layer, const lv_area_t *obj_coords, lv_opa_t ove
     int32_t qr_px = qr_modules * px_per_module;
     int32_t quiet_px = QR_LAYOUT_QUIET_MODULES * px_per_module;
 
-    // Centered horizontally; flush to the top vertically (origin_y is
-    // exactly quiet_px down from the tile's own top edge, i.e. the white
-    // quiet-zone border's top edge sits flush at y1, no extra margin above
-    // it) -- leaves every bit of this dimension's leftover space below the
-    // code for the progress bar (qr_progress_bar) instead of splitting it
-    // above+below where the bar can't use it.
+    // Centered horizontally always. Vertically: near-flush to the top in
+    // portrait (origin_y is QR_LAYOUT_TOP_MARGIN + quiet_px down from the
+    // tile's own top edge, clearing the physical screen's own rounded
+    // corners), but flush with *no* extra margin in landscape -- landscape's
+    // extra horizontal space already keeps the block clear of the corners,
+    // so shifting it down there too would just waste vertical room the
+    // progress bar could use. Must match qr_fit_px_per_module()'s own
+    // portrait check exactly, or the block could overflow the tile.
+    bool portrait = obj_h > obj_w;
+    int32_t top_margin = portrait ? QR_LAYOUT_TOP_MARGIN : 0;
     int32_t origin_x = obj_coords->x1 + (obj_w - qr_px) / 2;
-    int32_t origin_y = obj_coords->y1 + quiet_px;
+    int32_t origin_y = obj_coords->y1 + top_margin + quiet_px;
 
     lv_draw_rect_dsc_t bg_dsc;
     lv_draw_rect_dsc_init(&bg_dsc);
@@ -236,6 +272,9 @@ static void stop_qr(void)
     if (qr_progress_bar) {
         lv_obj_add_flag(qr_progress_bar, LV_OBJ_FLAG_HIDDEN);
     }
+    if (qr_purpose_label) {
+        lv_obj_add_flag(qr_purpose_label, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void stop_particles(void)
@@ -334,6 +373,22 @@ void rgb_tile_init(lv_obj_t *parent)
     lv_obj_center(pairing_message_label);
     lv_obj_add_flag(pairing_message_label, LV_OBJ_FLAG_HIDDEN);
 
+    // ShowQR's per-purpose caption -- only ever shown in portrait
+    // orientation (see show_qr_internal(), which positions it just below
+    // the QR block and decides visibility/text from qr_purpose). Montserrat
+    // 14, not 20, since the space this fits into is the tightest at some QR
+    // versions (see chat history: as little as ~44px between the code's
+    // bottom edge and the tile's own bottom edge in portrait).
+    qr_purpose_label = lv_label_create(parent);
+    lv_obj_set_style_text_font(qr_purpose_label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(qr_purpose_label, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_align(qr_purpose_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    // Single line always -- DOT truncates with an ellipsis rather than
+    // wrapping to a second line if a future caption ever runs long.
+    lv_label_set_long_mode(qr_purpose_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(qr_purpose_label, lv_pct(90));
+    lv_obj_add_flag(qr_purpose_label, LV_OBJ_FLAG_HIDDEN);
+
     lv_obj_add_event_cb(parent, rgb_tile_draw_event_cb, LV_EVENT_DRAW_POST, NULL);
 
     rgb_tile_show_qr("https://ka-ching.dk");
@@ -359,26 +414,31 @@ static void show_qr_internal(const char *text, int32_t display_seconds)
     qr_visible = true;
     bsp_display_set_brightness(QR_BACKLIGHT);   // wake the backlight for the QR
 
+    // Computed once, up front -- used for the progress bar's width below
+    // AND the purpose caption's position further down, so it's not
+    // duplicated between the two.
+    int32_t tile_w = 0, tile_h = 0, px_per_module = 0, code_width = 0;
+    if (obj_rgb_tile) {
+        tile_w = lv_obj_get_width(obj_rgb_tile);
+        tile_h = lv_obj_get_height(obj_rgb_tile);
+        px_per_module = qr_fit_px_per_module(qr_modules, tile_w, tile_h);
+        code_width = qr_modules * px_per_module;
+    }
+
     if (display_seconds <= 0) {
         if (qr_tick_timer) lv_timer_pause(qr_tick_timer);
         if (qr_progress_bar) lv_obj_add_flag(qr_progress_bar, LV_OBJ_FLAG_HIDDEN);
     } else {
         qr_seconds_left = display_seconds;
         if (qr_progress_bar) {
-            if (obj_rgb_tile) {
-                // As wide as the QR *code* itself, quiet zone excluded --
-                // including the quiet zone (an earlier version of this) was
-                // mathematically flush with the white border but read as
-                // visually too wide. Centering a narrower width within the
-                // same tile still lands exactly on the code's own left edge
-                // (origin_x in draw_qr is centered the same way), no
-                // separate offset needed.
-                int32_t tile_w = lv_obj_get_width(obj_rgb_tile);
-                int32_t tile_h = lv_obj_get_height(obj_rgb_tile);
-                int32_t px_per_module = qr_fit_px_per_module(qr_modules, tile_w, tile_h);
-                int32_t code_width = qr_modules * px_per_module;
-                lv_obj_set_width(qr_progress_bar, code_width);
-            }
+            // As wide as the QR *code* itself, quiet zone excluded --
+            // including the quiet zone (an earlier version of this) was
+            // mathematically flush with the white border but read as
+            // visually too wide. Centering a narrower width within the
+            // same tile still lands exactly on the code's own left edge
+            // (origin_x in draw_qr is centered the same way), no
+            // separate offset needed.
+            lv_obj_set_width(qr_progress_bar, code_width);
             // Range varies per call now (display_seconds is caller-chosen,
             // not always QR_VISIBLE_SECONDS), so it's set fresh every time
             // rather than once at init.
@@ -395,6 +455,34 @@ static void show_qr_internal(const char *text, int32_t display_seconds)
         }
     }
 
+    // Per-purpose caption -- portrait orientation only (the tile is taller
+    // than it is wide; landscape doesn't get one regardless of how much
+    // room happens to be there, per what was asked for). "Stub" purposes
+    // (AccountPay/GiftCard/LoyaltyCard/Coupon/MembershipSignup) and
+    // QR_PURPOSE_NONE (the plain/demo QR, which has no purpose concept)
+    // show nothing yet, same as before this existed.
+    const char *caption = NULL;
+    switch (qr_purpose) {
+    case 0x00: caption = "Hent kvittering"; break;      // Receipt
+    case 0x01: caption = "MobilePay"; break;            // MobilePay
+    case QR_PURPOSE_PAIRING: caption = "Scan med Ka-ching POS"; break;
+    default: break;                                      // stub -- no caption yet
+    }
+    if (qr_purpose_label) {
+        if (caption != NULL && tile_h > tile_w) {
+            int32_t quiet_px = QR_LAYOUT_QUIET_MODULES * px_per_module;
+            int32_t qr_px = qr_modules * px_per_module;
+            // QR_LAYOUT_TOP_MARGIN included -- matches draw_qr()'s own origin_y,
+            // so this sits right below the block's *actual* bottom edge.
+            int32_t block_bottom = QR_LAYOUT_TOP_MARGIN + qr_px + 2 * quiet_px;
+            lv_label_set_text(qr_purpose_label, caption);
+            lv_obj_align(qr_purpose_label, LV_ALIGN_TOP_MID, 0, block_bottom + 4);
+            lv_obj_remove_flag(qr_purpose_label, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(qr_purpose_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     if (obj_rgb_tile) {
         lv_obj_invalidate(obj_rgb_tile);
     }
@@ -402,17 +490,19 @@ static void show_qr_internal(const char *text, int32_t display_seconds)
 
 void rgb_tile_show_qr(const char *text)
 {
+    qr_purpose = QR_PURPOSE_NONE;   // no purpose concept on this path -- no caption
     show_qr_internal(text, QR_VISIBLE_SECONDS);
 }
 
 void rgb_tile_show_qr_persistent(const char *text)
 {
+    qr_purpose = QR_PURPOSE_PAIRING;   // "Scan med Ka-ching POS" -- see the caption switch above
     show_qr_internal(text, 0);
 }
 
 void rgb_tile_show_qr_timed(const char *text, int32_t display_seconds, uint8_t purpose)
 {
-    qr_purpose = purpose;   // not yet used for anything visual -- see rgb_tile.h
+    qr_purpose = purpose;
     show_qr_internal(text, display_seconds);
 }
 

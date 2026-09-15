@@ -130,7 +130,7 @@ a new opcode value rather than new GATT surface:
 
 | Characteristic | Properties | Purpose |
 |---|---|---|
-| `CMD` | Write | `[opcode: 1 byte][payload: opcode-dependent]`, encrypted (§6) the same as everything else. Write-only and no acknowledgement — see §5b. |
+| `CMD` | Write, Notify | `[opcode: 1 byte][payload: opcode-dependent]`, encrypted (§6) the same as everything else. Fire-and-forget for most opcodes; GetConfig's response is the one exception — see §5b. |
 
 No new ATT permissions are needed on it; the device enforces "session
 established" itself and treats undecryptable/absent-session/malformed
@@ -158,32 +158,71 @@ integers little-endian; all keys/tags raw bytes, not base64, over BLE):
 
 Same shape as the handshake — opcode byte + payload, this time carried
 inside the AES-GCM envelope from §6 (so the whole `[opcode][payload]` blob
-*is* the plaintext the app encrypts before writing `CMD`). App → device
-only; there's no device → app direction on this characteristic.
+*is* the plaintext the app encrypts before writing `CMD`). Mostly app →
+device only, with one exception: GetConfig's response comes back as its
+own opcode, notified to the requesting connection (subscribe to `CMD`'s
+notifications to receive it) — same "own opcode per message, even for a
+request/response pair" convention as the handshake in §5, and the same
+per-connection `ble_gatts_notify_custom` mechanism `PROV_HANDSHAKE`
+already uses, not the shared-value `ble_gatts_chr_updated()` path (see §9
+point 6's note on why that path can't do a real per-connection response).
 
-| Opcode | Name | Payload |
+| Opcode | Name | Direction | Payload |
+|---|---|---|---|
+| `0x01` | ShowQR | App → Device | `display_seconds`(2, little-endian) `purpose`(1) `text`(UTF-8, variable length, non-empty) |
+| `0x02` | Idle | App → Device | *(empty)* — backlight off, blank the tile |
+| `0x03` | DemoEffects | App → Device | *(empty)* — run the particle idle-effect cycle |
+| `0x04` | SetConfig | App → Device | `config_type`(1) `value`(shape depends on `config_type`) |
+| `0x05` | GetConfig | App → Device | `config_type`(1) |
+| `0x06` | ConfigValue | Device → App | `config_type`(1) `value`(same shape as that type's SetConfig `value`) |
+
+GetConfig only ever produces a ConfigValue notification when `config_type`
+is recognized and the write itself succeeds — an unrecognized type is
+rejected the same as a malformed opcode (a normal ATT write-response
+error), same as every other command; no ConfigValue follows in that case.
+
+**SetConfig's `config_type` values:**
+
+| Value | Meaning | `value` |
 |---|---|---|
-| `0x01` | ShowQR | `display_seconds`(2, little-endian) `purpose`(1) `text`(UTF-8, variable length, non-empty) |
-| `0x02` | Idle | *(empty)* — backlight off, blank the tile |
-| `0x03` | DemoEffects | *(empty)* — run the particle idle-effect cycle |
+| `0x00` | Orientation | 1 byte: `0`=0°, `1`=90°, `2`=180°, `3`=270° (clockwise) |
+
+Like `purpose`, `config_type` is append-only — a new persisted setting is a
+new value here, never a reused or renumbered one. Unlike every other
+command, **SetConfig doesn't apply immediately** for settings that need it
+(Orientation does): the device persists the new value to flash and
+restarts a moment later to apply it through its normal boot path, rather
+than attempting a live hardware-rotation change. Expect the connection to
+drop when this happens — that's the restart, not a failure. Future config
+types may or may not need a restart to apply; check each one's own
+behavior rather than assuming.
 
 **ShowQR's fields:**
 - `display_seconds`: how long the QR (and its progress bar) stays up before
   auto-hiding. `0` means *don't* time out — no auto-hide, and no progress
   bar shown at all (same behavior the pairing QR already uses internally).
-- `purpose`: a single-byte enum, communicated now but not yet acted on (no
-  text/symbol shown for it yet — reserved for a later UI addition so the
-  wire format doesn't need to change again once there is one):
+- `purpose`: a single-byte enum. In **portrait** orientation only (see
+  SetConfig below), a short caption is shown just below the code for the
+  two purposes that have one so far; every other value is communicated but
+  still shows nothing, same as before this existed:
 
-  | Value | Meaning |
-  |---|---|
-  | `0x00` | Receipt |
-  | `0x01` | MobilePay |
-  | `0x02` | AccountPay |
-  | `0x03` | GiftCard |
-  | `0x04` | LoyaltyCard |
-  | `0x05` | Coupon |
-  | `0x06` | MembershipSignup |
+  | Value | Meaning | Portrait caption |
+  |---|---|---|
+  | `0x00` | Receipt | "Hent kvittering" |
+  | `0x01` | MobilePay | "MobilePay" |
+  | `0x02` | AccountPay | *(none yet)* |
+  | `0x03` | GiftCard | *(none yet)* |
+  | `0x04` | LoyaltyCard | *(none yet)* |
+  | `0x05` | Coupon | *(none yet)* |
+  | `0x06` | MembershipSignup | *(none yet)* |
+
+  In landscape orientation, no caption is shown regardless of `purpose` —
+  this was a deliberate scope decision, not a space constraint.
+
+  The pairing QR (§3a/§3c, not driven by `ShowQR` at all) gets a caption
+  the same way, in portrait only: "Scan med Ka-ching POS". `purpose` isn't
+  part of that flow's wire format — this is purely a firmware-internal
+  detail — but it's worth knowing the same visual mechanism is behind it.
 
   An unrecognized value is rejected the same as a malformed opcode (a
   normal ATT write-response error), not silently defaulted.

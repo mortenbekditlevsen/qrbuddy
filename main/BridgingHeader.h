@@ -39,6 +39,7 @@
 #include "tileview/particle.h"
 #include "qrcodegen.h"
 #include "pairing.h"
+#include "device_config.h"
 
 #ifndef MYNEWT_VAL_BLE_LL_WHITELIST_SIZE
 #define MYNEWT_VAL_BLE_LL_WHITELIST_SIZE CONFIG_BT_NIMBLE_WHITELIST_SIZE

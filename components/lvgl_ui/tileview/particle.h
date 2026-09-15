@@ -37,6 +37,15 @@ typedef struct {
  * display without the quiet zone needing to shrink further. */
 #define QR_LAYOUT_QUIET_MODULES 3
 
+/* The physical screen's own cover glass/bezel has rounded corners that
+ * clip into the LVGL-addressable area slightly -- this margin (pixels,
+ * not modules) keeps the QR block's own rounded top corners clear of
+ * that. Lives here (not just in rgb_tile.c) so the Swift particle
+ * skeleton's layout (main/ParticleEffects.swift's qrTargets()) can stay
+ * in sync with draw_qr()'s, the same reason QR_LAYOUT_QUIET_MODULES is
+ * shared rather than duplicated. */
+#define QR_LAYOUT_TOP_MARGIN 10
+
 /* Implemented in rgb_tile.c, for the Swift particle skeleton (qrTargets() in
  * ParticleEffects.swift) to lay itself out identically to the solid QR it
  * crossfades into. Both are 0 until particle_qr_prepare() has been called at

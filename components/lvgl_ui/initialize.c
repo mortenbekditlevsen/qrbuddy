@@ -19,16 +19,15 @@
 #include "bsp_i2c.h"
 #include "bsp_qmi8658.h"
 
-#define EXAMPLE_DISPLAY_ROTATION 270
+#include "device_config.h"
 
-#if EXAMPLE_DISPLAY_ROTATION == 90 || EXAMPLE_DISPLAY_ROTATION == 270
-#define EXAMPLE_LCD_H_RES (280)
-#define EXAMPLE_LCD_V_RES (240)
-#else
-#define EXAMPLE_LCD_H_RES (240)
-#define EXAMPLE_LCD_V_RES (280)
-#endif
-
+// The panel's native (rotation-0) resolution is 240 wide x 280 tall;
+// 90/270 present it to LVGL as landscape 280x240 instead. Which of these
+// applies is now a runtime choice (device_config_get_orientation(), see
+// initialize()) instead of the compile-time EXAMPLE_DISPLAY_ROTATION this
+// used to be -- both bsp_display_init()'s buffer sizing and
+// app_lvgl_init()'s disp_cfg need the resolved h/v-res, so initialize()
+// computes them once and passes them to both.
 #define EXAMPLE_LCD_DRAW_BUFF_HEIGHT (50)
 #define EXAMPLE_LCD_DRAW_BUFF_DOUBLE (1)
 
@@ -41,7 +40,7 @@ static esp_lcd_panel_handle_t panel_handle = NULL;
 /* LVGL display and touch */
 static lv_display_t *lvgl_disp = NULL;
 
-static esp_err_t app_lvgl_init(void);
+static esp_err_t app_lvgl_init(uint8_t orientation, int32_t lcd_h_res, int32_t lcd_v_res);
 
 
 void show_qr(const char * text) {
@@ -135,9 +134,23 @@ void initialize(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    // Persisted orientation (device_config_*, NVS-backed) -- see
+    // docs/ble-provisioning.md's SetConfig command. Resolved once, here,
+    // and fed into both bsp_display_init()'s buffer sizing and
+    // app_lvgl_init()'s disp_cfg below.
+    uint8_t orientation = device_config_get_orientation();
+    int32_t lcd_h_res, lcd_v_res;
+    if (orientation == DEVICE_ORIENTATION_90 || orientation == DEVICE_ORIENTATION_270) {
+        lcd_h_res = 280;
+        lcd_v_res = 240;
+    } else {
+        lcd_h_res = 240;
+        lcd_v_res = 280;
+    }
+
     bsp_battery_init();
-    bsp_display_init(&io_handle, &panel_handle, EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT);
-    ESP_ERROR_CHECK(app_lvgl_init());
+    bsp_display_init(&io_handle, &panel_handle, lcd_h_res * EXAMPLE_LCD_DRAW_BUFF_HEIGHT);
+    ESP_ERROR_CHECK(app_lvgl_init(orientation, lcd_h_res, lcd_v_res));
 
     // Accelerometer -- currently only used for the "held upside-down at
     // boot" pairing-reset gesture (see Main.swift / qmi8658_is_upside_down()).
@@ -155,7 +168,7 @@ void initialize(void)
     }
 }
 
-static esp_err_t app_lvgl_init(void)
+static esp_err_t app_lvgl_init(uint8_t orientation, int32_t lcd_h_res, int32_t lcd_v_res)
 {
     /* Initialize LVGL */
     const lvgl_port_cfg_t lvgl_cfg = {
@@ -172,10 +185,10 @@ static esp_err_t app_lvgl_init(void)
     lvgl_port_display_cfg_t disp_cfg = {
         .io_handle = io_handle,
         .panel_handle = panel_handle,
-        .buffer_size = EXAMPLE_LCD_H_RES * EXAMPLE_LCD_DRAW_BUFF_HEIGHT,
+        .buffer_size = lcd_h_res * EXAMPLE_LCD_DRAW_BUFF_HEIGHT,
         .double_buffer = EXAMPLE_LCD_DRAW_BUFF_DOUBLE,
-        .hres = EXAMPLE_LCD_H_RES,
-        .vres = EXAMPLE_LCD_V_RES,
+        .hres = lcd_h_res,
+        .vres = lcd_v_res,
         .monochrome = false,
         /* Rotation values must be same as used in esp_lcd for initial settings of the screen */
         .rotation = {
@@ -189,24 +202,32 @@ static esp_err_t app_lvgl_init(void)
             .swap_bytes = true,
 #endif
         }};
-#if EXAMPLE_DISPLAY_ROTATION == 90
-    disp_cfg.rotation.swap_xy = true;
-    disp_cfg.rotation.mirror_x = true;
-    disp_cfg.rotation.mirror_y = false;
-    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 20, 0));
-#elif EXAMPLE_DISPLAY_ROTATION == 180
-    disp_cfg.rotation.swap_xy = false;
-    disp_cfg.rotation.mirror_x = true;
-    disp_cfg.rotation.mirror_y = true;
-    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 0, 20));
-#elif EXAMPLE_DISPLAY_ROTATION == 270
-    disp_cfg.rotation.swap_xy = true;
-    disp_cfg.rotation.mirror_x = false;
-    disp_cfg.rotation.mirror_y = true;
-    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 20, 0));
-#else
-    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 0, 20));
-#endif
+    // Same four cases as before, just a runtime switch on the persisted
+    // orientation (device_config_get_orientation(), resolved by the
+    // caller) instead of a compile-time EXAMPLE_DISPLAY_ROTATION.
+    switch (orientation) {
+    case DEVICE_ORIENTATION_90:
+        disp_cfg.rotation.swap_xy = true;
+        disp_cfg.rotation.mirror_x = true;
+        disp_cfg.rotation.mirror_y = false;
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 20, 0));
+        break;
+    case DEVICE_ORIENTATION_180:
+        disp_cfg.rotation.swap_xy = false;
+        disp_cfg.rotation.mirror_x = true;
+        disp_cfg.rotation.mirror_y = true;
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 0, 20));
+        break;
+    case DEVICE_ORIENTATION_270:
+        disp_cfg.rotation.swap_xy = true;
+        disp_cfg.rotation.mirror_x = false;
+        disp_cfg.rotation.mirror_y = true;
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 20, 0));
+        break;
+    default:   // DEVICE_ORIENTATION_0
+        ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 0, 20));
+        break;
+    }
     lvgl_disp = lvgl_port_add_disp(&disp_cfg);
 
     // static lv_indev_drv_t indev_drv = {};

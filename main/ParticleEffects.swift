@@ -792,9 +792,13 @@ private func qrTargets(tileW: Int32, tileH: Int32, into out: inout [SlotTarget])
     let qrPx = Float(modules) * cellPx
     let originX = (Float(tileW) - qrPx) / 2
     // Matches draw_qr's own top-aligned vertical placement (rgb_tile.c) --
-    // flush to the tile's top edge, quiet-zone margin and all, rather than
-    // centered, so the crossfade lines up with what it settles into.
-    let originY = Float(QR_LAYOUT_QUIET_MODULES) * cellPx
+    // near-flush to the tile's top edge, quiet-zone margin included,
+    // rather than centered, so the crossfade lines up with what it settles
+    // into. QR_LAYOUT_TOP_MARGIN (clears the physical screen's own rounded
+    // corners) only applies in portrait -- landscape's extra horizontal
+    // space already keeps the block clear without shifting it down too.
+    let topMargin = tileH > tileW ? Float(QR_LAYOUT_TOP_MARGIN) : 0
+    let originY = topMargin + Float(QR_LAYOUT_QUIET_MODULES) * cellPx
     let dotSize = cellPx * 1.1
 
     // modules = 4*version + 17 exactly, for every version -- integer
