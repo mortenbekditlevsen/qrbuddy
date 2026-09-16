@@ -71,17 +71,48 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 2.9.0
+  espressif/qrcode:
+    component_hash: 31e70991ce22f28d73a4386417fc9c0993f61e1aab1832474fd9e3db8da9dcbd
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.2.0
   idf:
     source:
       type: idf
     version: 5.5.2
   lvgl/lvgl:
-    component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
-    dependencies: []
+    component_hash: d5e723db3a3feca71e34e333a6598b7624e3822577d374e1d44f0e18374952e1
+    dependencies:
+    - name: espressif/freetype
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=5.5 && $CONFIG{LV_USE_FREETYPE} == True
+      version: ^2.14.3
+    - name: espressif/libjpeg-turbo
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=5.5 && $CONFIG{LV_USE_LIBJPEG_TURBO} == True
+      version: ^3.1.1
+    - name: espressif/libpng
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=5.5 && $CONFIG{LV_USE_LIBPNG} == True
+      version: ^1.6.58
+    - name: espressif/lz4
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=5.5 && $CONFIG{LV_USE_LZ4} == True && $CONFIG{LV_USE_LZ4_INTERNAL} == False
+      version: ^1.10.0
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 9.5.0
+    version: 9.6.0
 direct_dependencies:
 - espressif/button
 - espressif/cmake_utilities
@@ -89,7 +120,8 @@ direct_dependencies:
 - espressif/esp_lcd_touch
 - espressif/esp_lcd_touch_cst816s
 - espressif/esp_lvgl_port
+- espressif/qrcode
 - lvgl/lvgl
-manifest_hash: a888f551be1dd2dbd2228fd03cc6d1d4fc72287c29c0747e44cb65f71b289995
+manifest_hash: 28cf8eb7a4cdc6580197fef1170e4a3c4ff57bfa5f922a4d396a4800b3363234
 target: esp32c6
 version: 2.0.0

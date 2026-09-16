@@ -6,3 +6,4 @@ dependencies:
   espressif/esp_lvgl_port: '*'
   lvgl/lvgl: '*'
   espressif/esp_codec_dev: '*'
+  espressif/qrcode: '*'

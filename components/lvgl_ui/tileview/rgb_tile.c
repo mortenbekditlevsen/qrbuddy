@@ -1,11 +1,14 @@
 #include "rgb_tile.h"
 
-#include "qrcodegen.h"
+// espressif/qrcode (Component-Registry-published wrapper around the same
+// qrcodegen.c this project used to vendor directly under
+// components/qrcodegen -- see qr_generate()'s own comment below) instead of
+// qrcodegen.h directly.
+#include "qrcode.h"
 #include "bsp_display.h"
 #include "particle.h"
 #include "device_config.h"
 
-#define QR_MAX_MODULES   qrcodegen_BUFFER_LEN_FOR_VERSION(40) // generous upper bound
 #define QR_VISIBLE_SECONDS 60  // how long the QR code stays on screen
 // Backlight % while a QR code is on screen -- device_config_get_qr_
 // brightness(), not a fixed constant anymore: persisted and BLE-configurable
@@ -113,34 +116,45 @@ static int32_t qr_fit_px_per_module(int32_t modules, int32_t tile_w, int32_t til
     return px < 1 ? 1 : px;
 }
 
-static bool qr_generate(const char * text)
+// esp_qrcode_generate()'s display callback -- called synchronously, before
+// esp_qrcode_generate() itself returns and frees its own internal qrcodegen
+// buffers, so this is the only place the transient `qrcode` handle is ever
+// touched. Copies the result into qr_buf/qr_modules, same as this file did
+// directly against qrcodegen's synchronous API before switching to
+// espressif/qrcode (see qr_generate()'s own comment).
+static void qr_copy_module_grid(esp_qrcode_handle_t qrcode)
 {
-    uint8_t qrcode[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
-    uint8_t tempBuffer[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
-
-    // minVersion/maxVersion span QR_MIN_VERSION..QR_MAX_VERSION -- qrcodegen
-    // itself picks the smallest version in that range the text (plus ECC)
-    // actually fits in, so this is the entire "dynamic version" feature on
-    // the encode side; module count (and everything downstream: on-screen
-    // pixel size, particle skeleton layout) just follows whatever came back.
-    bool ok = qrcodegen_encodeText(
-        text,
-        tempBuffer,
-        qrcode,
-        qrcodegen_Ecc_MEDIUM,
-        QR_MIN_VERSION, QR_MAX_VERSION,
-        qrcodegen_Mask_AUTO,
-        true);
-
-    if (!ok) return false;
-
-    qr_modules = qrcodegen_getSize(qrcode);
+    qr_modules = esp_qrcode_get_size(qrcode);
     for (int y = 0; y < qr_modules; y++) {
         for (int x = 0; x < qr_modules; x++) {
-            qr_buf[y][x] = qrcodegen_getModule(qrcode, x, y) ? 1 : 0;
+            qr_buf[y][x] = esp_qrcode_get_module(qrcode, x, y) ? 1 : 0;
         }
     }
-    return true;
+}
+
+static bool qr_generate(const char * text)
+{
+    // espressif/qrcode is a Component-Registry-published wrapper around the
+    // same qrcodegen.c this project used to vendor directly under
+    // components/qrcodegen (that copy had come from a plain `git clone` of
+    // nayuki/QR-Code-generator with no proper git submodule registration --
+    // broken for anyone else checking this repo out). Its esp_qrcode_generate()
+    // heap-allocates its own qrcodegen buffers internally (freed again
+    // before it returns) and hands the result to qr_copy_module_grid() above
+    // via callback, rather than returning it directly the way qrcodegen's
+    // own qrcodegen_encodeText() did. Verified against its source
+    // (esp_qrcode_main.c) that it calls qrcodegen_encodeText() with
+    // qrcodegen_VERSION_MIN (== QR_MIN_VERSION's value, 1),
+    // cfg.max_qrcode_version, qrcodegen_Mask_AUTO, and boostEcl=true -- the
+    // exact same parameters this file passed directly before, so this is a
+    // byte-identical swap, not just an equivalent one.
+    esp_qrcode_config_t cfg = {
+        .display_func = qr_copy_module_grid,
+        .max_qrcode_version = QR_MAX_VERSION,
+        .qrcode_ecc_level = ESP_QRCODE_ECC_MED,
+        .user_data = NULL,
+    };
+    return esp_qrcode_generate(&cfg, text) == ESP_OK;
 }
 
 int32_t particle_qr_modules(void)

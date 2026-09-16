@@ -37,7 +37,7 @@
 
 #include "initialize.h"
 #include "tileview/particle.h"
-#include "qrcodegen.h"
+#include "qrcode.h"
 #include "pairing.h"
 #include "device_config.h"
 
