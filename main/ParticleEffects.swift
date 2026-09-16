@@ -83,6 +83,7 @@ enum CurrentParticleEffect {
     case starfield(Starfield)
     case sphere(Sphere)
     case cube(Cube)
+    case spirograph(Spirograph)
     case qr(String)   // the URL to encode; regenerated (cached) only when it changes
 }
 
@@ -175,6 +176,7 @@ private func springDampFor(_ effect: CurrentParticleEffect) -> (k: Float, dampin
     case .starfield: return (Starfield.springK, Starfield.damping)
     case .sphere:    return (Sphere.springK, Sphere.damping)
     case .cube:      return (Cube.springK, Cube.damping)
+    case .spirograph: return (Spirograph.springK, Spirograph.damping)
     case .qr:        return (Sphere.springK, Sphere.damping)  // same "settle into formation" role as sphere/cube
     }
 }
@@ -197,6 +199,10 @@ private func tick(_ effect: inout CurrentParticleEffect, tileW: Int32, tileH: In
     case .cube(var e):
         let n = e.targets(tileW: tileW, tileH: tileH, into: &out)
         effect = .cube(e)
+        return n
+    case .spirograph(var e):
+        let n = e.targets(tileW: tileW, tileH: tileH, into: &out)
+        effect = .spirograph(e)
         return n
     case .qr:
         return qrTargets(tileW: tileW, tileH: tileH, into: &out)
@@ -234,6 +240,7 @@ private func beginTransition(tileW: Int32, tileH: Int32) {
     case .starfield(var e): e.reset(tileW: tileW, tileH: tileH); currentEffect = .starfield(e)
     case .sphere(var e):    e.reset(tileW: tileW, tileH: tileH); currentEffect = .sphere(e)
     case .cube(var e):      e.reset(tileW: tileW, tileH: tileH); currentEffect = .cube(e)
+    case .spirograph(var e): e.reset(tileW: tileW, tileH: tileH); currentEffect = .spirograph(e)
     case .qr(let url):
         // Encode right away (not lazily at crossfade time) so
         // particle_qr_modules() is valid from this effect's very first tick
@@ -285,7 +292,8 @@ func particle_effect_tick(
         switch currentEffect {
         case .starfield: currentEffect = .sphere(Sphere())
         case .sphere:    currentEffect = .cube(Cube())
-        case .cube:      currentEffect = .starfield(Starfield())
+        case .cube:      currentEffect = .spirograph(Spirograph())
+        case .spirograph: currentEffect = .starfield(Starfield())
         // .qr is no longer part of the DemoEffects auto-cycle (dropped per
         // request) -- kept here only for CurrentParticleEffect's switch
         // exhaustiveness. Currently unreachable: nothing else switches
@@ -671,6 +679,165 @@ struct Cube {
                 size: min(max(2.5 * scale, 1), 6),
                 alpha: min(max(0.25 + scale * 0.55, 0.15), 1),
                 hue: p.hue
+            )
+        }
+        return Int32(points.count)
+    }
+}
+
+// MARK: - Spirograph (hypotrochoid)
+
+/// A hypotrochoid -- the classic "spirograph" curve traced by a point on a
+/// small wheel (radius `innerRadius`) rolling inside a fixed wheel (radius
+/// `outerRadius`), at a "pencil distance" `rho` from the small wheel's own
+/// center:
+///
+///   x(theta) = (R-r)*cos(theta) + rho*cos(k*theta)
+///   y(theta) = (R-r)*sin(theta) - rho*sin(k*theta),   k = (R-r)/r
+///
+/// Three independent motions layer on top of that fixed R/r ratio, all
+/// driven by LUT-step accumulators -- never raw libm calls per tick, same
+/// reason TrigLUT itself exists (no hardware FPU on this chip). Every
+/// accumulator is wrapped mod TrigLUT.steps every tick rather than left to
+/// grow unboundedly: this runs for weeks at a time, and Float32 eventually
+/// loses the precision to even represent its own per-tick increment once
+/// the raw sum gets large enough.
+///   - `rho` itself breathes between 0 (a plain circle -- "pencil at the
+///     wheel's own center") and *beyond* innerRadius (impossible on a real
+///     spirograph, where the pencil can't leave the wheel -- but the
+///     formula doesn't care, and self-intersecting loops are exactly the
+///     point here), via a slow sine.
+///   - `flow` rotates every particle's own theta forward together (and
+///     k*theta by the matching amount) -- i.e. every particle advances
+///     along the *same* fixed curve, like beads flowing along a wire.
+///   - a separate, independent `rotation` spins the whole composed shape
+///     rigidly, at its own (slower) rate, so flow and spin read as two
+///     distinct motions rather than one.
+/// Particles are spread along the curve's full closure range with a little
+/// random per-particle jitter (deliberately not perfectly even spacing),
+/// fixed once at reset.
+struct Spirograph {
+    static let count = 160
+    static let springK: Float = 90
+    static let damping: Float = 14
+
+    // Coprime by construction -- required for the curve to close after
+    // theta sweeps exactly 2*pi*innerRadius (theta's own period, 2*pi, and
+    // k*theta's period, 2*pi*innerRadius/(outerRadius-innerRadius), share
+    // that as their first common multiple exactly when
+    // gcd(outerRadius, innerRadius) == 1). Gives a 7-lobed flower at
+    // rho == innerRadius (a hypocycloid: outerRadius/gcd cusps).
+    static let outerRadius: Float = 7
+    static let innerRadius: Float = 3
+    // k*theta = theta * (outerRadius-innerRadius)/innerRadius; since
+    // theta = thetaFraction * 2*pi*innerRadius, this simplifies to
+    // thetaFraction * 2*pi*(outerRadius-innerRadius) -- no separate k needed.
+    static let outerMinusInner: Float = outerRadius - innerRadius
+
+    static let rhoBase: Float = innerRadius * 0.8
+    static let rhoAmplitude: Float = innerRadius * 0.8   // rho ranges 0 ... 1.6*innerRadius
+
+    // LUT-steps (of TrigLUT.steps == 256, i.e. one full circle) accumulated
+    // per tick, chosen for roughly a 24s breathe, 14s flow lap, 40s spin.
+    static let rhoStepsPerTick: Float = Float(TrigLUT.steps) / (24 * 20)
+    static let flowStepsPerTick: Float = Float(TrigLUT.steps) / (14 * 20)
+    static let kFlowStepsPerTick: Float = flowStepsPerTick * outerMinusInner / innerRadius
+    static let rotStepsPerTick: Float = Float(TrigLUT.steps) / (40 * 20)
+
+    private struct Point {
+        var c1x: Float = 1, c1y: Float = 0   // cos/sin(theta0)
+        var c2x: Float = 1, c2y: Float = 0   // cos(k*theta0), -sin(k*theta0)
+        var hue: Float = 210
+    }
+    private var points: [Point]
+
+    private var rhoStep: Float = 0
+    private var flowStep: Float = 0
+    private var kFlowStep: Float = 0
+    private var rotStep: Float = 0
+
+    init() {
+        points = Array(repeating: Point(), count: Spirograph.count)
+    }
+
+    mutating func reset(tileW: Int32, tileH: Int32) {
+        let n = Spirograph.count
+        for i in 0 ..< n {
+            // Evenly spaced base position, jittered by up to ~0.4 of one
+            // slot's width so the spacing along the curve isn't perfectly
+            // mechanical -- fixed here, at reset, not re-rolled per tick.
+            let baseFraction = Float(i) / Float(n)
+            let jitter = Float.random(in: -0.4...0.4) / Float(n)
+            let thetaFraction = baseFraction + jitter
+
+            let theta0 = thetaFraction * 2 * Float.pi * Spirograph.innerRadius
+            let kTheta0 = thetaFraction * 2 * Float.pi * Spirograph.outerMinusInner
+
+            points[i].c1x = cosf(theta0)
+            points[i].c1y = sinf(theta0)
+            points[i].c2x = cosf(kTheta0)
+            points[i].c2y = -sinf(kTheta0)
+            points[i].hue = baseFraction * 360   // one smooth rainbow sweep over the whole curve
+        }
+        rhoStep = 0
+        flowStep = 0
+        kFlowStep = 0
+        rotStep = 0
+    }
+
+    fileprivate mutating func targets(tileW: Int32, tileH: Int32, into out: inout [SlotTarget]) -> Int32 {
+        let w = Float(tileW), h = Float(tileH)
+        let cx = w / 2, cy = h / 2
+
+        // Wrapped mod TrigLUT.steps every tick -- see this type's header
+        // comment for why (weeks-long uptime, Float32 precision).
+        let steps = Float(TrigLUT.steps)
+        rhoStep = (rhoStep + Spirograph.rhoStepsPerTick).truncatingRemainder(dividingBy: steps)
+        flowStep = (flowStep + Spirograph.flowStepsPerTick).truncatingRemainder(dividingBy: steps)
+        kFlowStep = (kFlowStep + Spirograph.kFlowStepsPerTick).truncatingRemainder(dividingBy: steps)
+        rotStep = (rotStep + Spirograph.rotStepsPerTick).truncatingRemainder(dividingBy: steps)
+
+        let rho = Spirograph.rhoBase + Spirograph.rhoAmplitude * TrigLUT.sin(Int32(rhoStep.rounded()))
+        let cosD = TrigLUT.cos(Int32(flowStep.rounded())), sinD = TrigLUT.sin(Int32(flowStep.rounded()))
+        let cosKD = TrigLUT.cos(Int32(kFlowStep.rounded())), sinKD = TrigLUT.sin(Int32(kFlowStep.rounded()))
+        let cosR = TrigLUT.cos(Int32(rotStep.rounded())), sinR = TrigLUT.sin(Int32(rotStep.rounded()))
+
+        // The curve's own farthest point from center is always exactly
+        // (outerRadius-innerRadius)+rho (provable: |pos(theta)|^2 maxes out
+        // there) -- so this scale keeps the whole shape snugly filling the
+        // tile's available square-ish area no matter what rho currently is.
+        let targetRadius = min(w, h) * 0.42
+        let scale = targetRadius / (Spirograph.outerMinusInner + rho)
+
+        for i in 0 ..< points.count {
+            let p = points[i]
+
+            // Rotate term1 (cos theta0, sin theta0) forward by flowStep.
+            let t1x = p.c1x * cosD - p.c1y * sinD
+            let t1y = p.c1y * cosD + p.c1x * sinD
+
+            // Rotate term2 (cos k*theta0, -sin k*theta0) forward by
+            // kFlowStep. Note the signs here don't match a textbook
+            // rotation matrix -- c2y already carries the formula's own
+            // minus sign, so combining it back in needs the signs that
+            // fall out of actually expanding cos/sin(k*theta0 + k*flow),
+            // not the generic (a cos - b sin, a sin + b cos) pattern.
+            let t2x = p.c2x * cosKD + p.c2y * sinKD
+            let t2y = p.c2y * cosKD - p.c2x * sinKD
+
+            var px = Spirograph.outerMinusInner * t1x + rho * t2x
+            var py = Spirograph.outerMinusInner * t1y + rho * t2y
+
+            // Independent rigid spin of the whole composed shape, on top
+            // of (not instead of) the per-particle flow above.
+            let rx = px * cosR - py * sinR
+            let ry = px * sinR + py * cosR
+            px = rx; py = ry
+
+            out[i] = SlotTarget(
+                x: cx + px * scale, y: cy + py * scale,
+                size: 2.5 + 1.5 * (rho / (Spirograph.rhoBase + Spirograph.rhoAmplitude)),
+                alpha: 0.9, hue: p.hue
             )
         }
         return Int32(points.count)
