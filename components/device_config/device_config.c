@@ -3,6 +3,7 @@
 #include "nvs.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_attr.h"
 
 #define NVS_NAMESPACE          "qrb_cfg"
 #define NVS_KEY_ORIENTATION    "orient"
@@ -70,8 +71,18 @@ static void restart_timer_cb(void *arg)
     esp_restart();
 }
 
+// RTC memory survives esp_restart() (a software reset) but the bootloader
+// zeroes it on a real power-on -- exactly the "was the boot in progress one
+// we triggered ourselves, or a fresh power-up" distinction
+// device_config_consume_restart_skip() needs, with no magic-number sentinel
+// required (unlike RTC_NOINIT_ATTR, which isn't zeroed on power-on and so
+// can't tell "never touched" apart from "happens to read as false").
+static RTC_DATA_ATTR bool s_restart_was_scheduled;
+
 void device_config_schedule_restart(void)
 {
+    s_restart_was_scheduled = true;   // consumed once, on the other side of the reboot -- see device_config_consume_restart_skip()
+
     const esp_timer_create_args_t args = {
         .callback = restart_timer_cb,
         .name = "cfg_restart",
@@ -80,4 +91,11 @@ void device_config_schedule_restart(void)
     if (esp_timer_create(&args, &timer) == ESP_OK) {
         esp_timer_start_once(timer, 300 * 1000);   // 300ms, in microseconds
     }
+}
+
+bool device_config_consume_restart_skip(void)
+{
+    bool was = s_restart_was_scheduled;
+    s_restart_was_scheduled = false;   // one-shot -- only this boot reads true
+    return was;
 }

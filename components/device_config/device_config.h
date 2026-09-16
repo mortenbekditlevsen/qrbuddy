@@ -54,8 +54,23 @@ bool device_config_set_orientation(uint8_t orientation);
 /* Restarts the device shortly (not immediately -- gives NimBLE a moment to
  * actually transmit the write's ATT response before the SoC resets,
  * rather than cutting it off mid-transmit) after a config change that
- * needs a reboot to take effect. */
+ * needs a reboot to take effect. Marks the upcoming boot so
+ * device_config_consume_restart_skip() reads true exactly once on the
+ * other side -- see that function's own comment. */
 void device_config_schedule_restart(void);
+
+/* True if the boot currently in progress was caused by
+ * device_config_schedule_restart() (an intentional, BLE-triggered restart
+ * to apply a config change) rather than a real power-on/reset -- for
+ * initialize.c to skip anything that only makes sense on a fresh power-up
+ * (currently: the boot logo -- the user just saw it seconds ago, right
+ * before the restart that got them here). One-shot: reading this clears
+ * it, so only the single boot right after a scheduled restart reads true,
+ * never any boot after that. Backed by RTC memory, not NVS -- it only
+ * needs to survive esp_restart() (a software reset), not a real power
+ * cycle, and RTC memory is zeroed by the bootloader on power-on, so a
+ * genuine fresh boot always reads false here with no extra bookkeeping. */
+bool device_config_consume_restart_skip(void);
 
 // LCD backlight percentage (0-100) while a QR code is on screen -- both
 // the BLE/command-triggered display and the pairing QR use this (see
