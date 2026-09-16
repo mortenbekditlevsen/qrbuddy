@@ -96,6 +96,7 @@ private var previousEffect: CurrentParticleEffect?   // kept "alive" (still tick
 // must track PARTICLE_TICK_MS in rgb_tile.c (currently 50 ms -> 20 Hz).
 // Remove this block once you've settled on how effects should actually switch.
 private let ticksPerEffect: Int32 = 5 * 20  // 5s * 20 Hz
+private let ticksForSpirographEffect: Int32 = 8 * 20 // 8s * 20 Hz
 private var ticksUntilSwitch: Int32 = ticksPerEffect
 
 // Crossfade from the particle-formed QR silhouette to the real, fully-
@@ -291,9 +292,14 @@ func particle_effect_tick(
         previousEffect = currentEffect
         switch currentEffect {
         case .starfield: currentEffect = .sphere(Sphere())
-        case .sphere:    currentEffect = .cube(Cube())
-        case .cube:      currentEffect = .spirograph(Spirograph())
-        case .spirograph: currentEffect = .starfield(Starfield())
+        case .sphere:
+            currentEffect = .spirograph(Spirograph())
+            ticksUntilSwitch = ticksForSpirographEffect
+
+        case .spirograph: currentEffect = .cube(Cube())
+
+        case .cube:       currentEffect = .starfield(Starfield())
+    
         // .qr is no longer part of the DemoEffects auto-cycle (dropped per
         // request) -- kept here only for CurrentParticleEffect's switch
         // exhaustiveness. Currently unreachable: nothing else switches
@@ -738,8 +744,16 @@ struct Spirograph {
     static let rhoAmplitude: Float = innerRadius * 0.8   // rho ranges 0 ... 1.6*innerRadius
 
     // LUT-steps (of TrigLUT.steps == 256, i.e. one full circle) accumulated
-    // per tick, chosen for roughly a 24s breathe, 14s flow lap, 40s spin.
-    static let rhoStepsPerTick: Float = Float(TrigLUT.steps) / (24 * 20)
+    // per tick, chosen for roughly a 6s breathe, 14s flow lap, 40s spin.
+    static let rhoStepsPerTick: Float = Float(TrigLUT.steps) / (6 * 20)
+    // rho == rhoBase (this cycle's own zero-crossing, where it starts by
+    // default) looks thin/underdeveloped -- the fuller loops only show up
+    // partway into the breathe. Starting instead at the phase that forward
+    // playback would reach after 6s skips straight past the thin part, and
+    // the breathe direction is reversed from there (see targets() below)
+    // so it eases *out* of that fuller look rather than snapping back
+    // toward thin immediately after starting.
+    static let rhoInitialStep: Float = rhoStepsPerTick * (6 * 20)
     static let flowStepsPerTick: Float = Float(TrigLUT.steps) / (14 * 20)
     static let kFlowStepsPerTick: Float = flowStepsPerTick * outerMinusInner / innerRadius
     static let rotStepsPerTick: Float = Float(TrigLUT.steps) / (40 * 20)
@@ -779,7 +793,7 @@ struct Spirograph {
             points[i].c2y = -sinf(kTheta0)
             points[i].hue = baseFraction * 360   // one smooth rainbow sweep over the whole curve
         }
-        rhoStep = 0
+        rhoStep = Spirograph.rhoInitialStep
         flowStep = 0
         kFlowStep = 0
         rotStep = 0
@@ -792,7 +806,9 @@ struct Spirograph {
         // Wrapped mod TrigLUT.steps every tick -- see this type's header
         // comment for why (weeks-long uptime, Float32 precision).
         let steps = Float(TrigLUT.steps)
-        rhoStep = (rhoStep + Spirograph.rhoStepsPerTick).truncatingRemainder(dividingBy: steps)
+        // Reversed (subtracting, not adding) relative to the other three
+        // accumulators below -- see rhoInitialStep's comment.
+        rhoStep = (rhoStep - Spirograph.rhoStepsPerTick).truncatingRemainder(dividingBy: steps)
         flowStep = (flowStep + Spirograph.flowStepsPerTick).truncatingRemainder(dividingBy: steps)
         kFlowStep = (kFlowStep + Spirograph.kFlowStepsPerTick).truncatingRemainder(dividingBy: steps)
         rotStep = (rotStep + Spirograph.rotStepsPerTick).truncatingRemainder(dividingBy: steps)
