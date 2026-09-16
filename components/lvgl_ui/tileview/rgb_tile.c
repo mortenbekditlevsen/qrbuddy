@@ -3,10 +3,13 @@
 #include "qrcodegen.h"
 #include "bsp_display.h"
 #include "particle.h"
+#include "device_config.h"
 
 #define QR_MAX_MODULES   qrcodegen_BUFFER_LEN_FOR_VERSION(40) // generous upper bound
 #define QR_VISIBLE_SECONDS 60  // how long the QR code stays on screen
-#define QR_BACKLIGHT     20    // backlight % while a QR code is on screen
+// Backlight % while a QR code is on screen -- device_config_get_qr_
+// brightness(), not a fixed constant anymore: persisted and BLE-configurable
+// (docs/ble-provisioning.md's SetConfig QRBrightness), applied live.
 
 // QR_LAYOUT_TOP_MARGIN (particle.h -- shared with the, currently dead-code,
 // Swift particle skeleton so the two can't drift apart) is reserved
@@ -47,6 +50,16 @@ static uint8_t qr_buf[177][177]; // 177 = max modules at version 40
 static int qr_modules = 0;
 static bool qr_visible = false;        // whether draw_qr should paint anything (the "real", BLE-triggered display)
 static uint8_t qr_purpose = QR_PURPOSE_NONE;   // set by whichever rgb_tile_show_qr*() was called last; drives the caption switch in show_qr_internal()
+
+// Presentation/dismiss fade for the "real" QR display -- ramped 0->255 on
+// first appearing from nothing and 255->0 on disappearing to nothing
+// (countdown expiry, Idle), via start_qr_fade()'s lv_anim. Replacing an
+// already-visible QR with a different one (a new ShowQR, or a new
+// pairing/demo QR) cuts straight to 255 with no animation -- deliberately
+// scoped to just the two "nothing <-> QR" transitions, not "QR <-> other
+// content", to avoid animating a fade-out while something else (particles,
+// message) is already rendering underneath it.
+static uint8_t qr_fade_opa = 0;
 
 // Solid-QR overlay for the particle effect's QR case: once its particles
 // settle into the silhouette, Swift crossfades this in on top (reusing the
@@ -252,7 +265,7 @@ static void rgb_tile_draw_event_cb(lv_event_t * e)
     lv_obj_get_coords(obj, &obj_coords);
 
     if (qr_visible) {
-        draw_qr(layer, &obj_coords, LV_OPA_COVER);
+        draw_qr(layer, &obj_coords, qr_fade_opa);
     } else {
         if (particles_active) {
             draw_particles(layer, &obj_coords);
@@ -261,6 +274,34 @@ static void rgb_tile_draw_event_cb(lv_event_t * e)
             draw_qr(layer, &obj_coords, particle_qr_overlay_opa);
         }
     }
+}
+
+#define QR_FADE_MS 180   // "quick" -- short enough not to make ShowQR feel sluggish
+
+static void qr_fade_opa_anim_cb(void *var, int32_t value)
+{
+    LV_UNUSED(var);
+    qr_fade_opa = (uint8_t) value;
+    if (obj_rgb_tile) lv_obj_invalidate(obj_rgb_tile);
+}
+
+/* Starts (or redirects, cancelling anything already running on
+ * qr_fade_opa first) an opacity ramp from its current value to `to` over
+ * QR_FADE_MS. `completed_cb` (may be NULL) fires only if this animation
+ * runs to completion naturally -- not if a later call to this function
+ * cancels it first, which matters for e.g. a fade-out being interrupted
+ * by a new ShowQR arriving before it finishes. */
+static void start_qr_fade(int32_t to, lv_anim_completed_cb_t completed_cb)
+{
+    lv_anim_delete(&qr_fade_opa, NULL);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &qr_fade_opa);
+    lv_anim_set_exec_cb(&a, qr_fade_opa_anim_cb);
+    lv_anim_set_values(&a, qr_fade_opa, to);
+    lv_anim_set_duration(&a, QR_FADE_MS);
+    if (completed_cb) lv_anim_set_completed_cb(&a, completed_cb);
+    lv_anim_start(&a);
 }
 
 /* Stop each effect without touching the backlight — used when the other
@@ -289,14 +330,27 @@ static void stop_message(void)
     if (pairing_message_label) lv_obj_add_flag(pairing_message_label, LV_OBJ_FLAG_HIDDEN);
 }
 
-/* Take the QR code off screen: stop the countdown, blank the tile, backlight off. */
-static void hide_qr(void)
+/* Finishes taking the QR off screen once its fade-out (see hide_qr()/
+ * rgb_tile_idle()) actually completes -- deferred so the backlight
+ * doesn't cut and the tile doesn't blank until the fade is done, rather
+ * than going dark mid-fade. */
+static void qr_fade_out_completed(lv_anim_t *a)
 {
+    LV_UNUSED(a);
     stop_qr();
     if (obj_rgb_tile) {
         lv_obj_invalidate(obj_rgb_tile);
     }
     bsp_display_set_brightness(0);
+}
+
+/* Take the QR code off screen: stop the countdown immediately (so it can't
+ * fire again mid-fade), fade out, then actually blank the tile and kill
+ * the backlight once that fade completes (qr_fade_out_completed()). */
+static void hide_qr(void)
+{
+    if (qr_tick_timer) lv_timer_pause(qr_tick_timer);
+    start_qr_fade(0, qr_fade_out_completed);
 }
 
 /* 1 Hz while a QR code is showing. Runs on the LVGL task (holding the port
@@ -408,11 +462,16 @@ static void show_qr_internal(const char *text, int32_t display_seconds)
     if (!qr_generate(text)) {
         return; /* text too long for the fixed QR version; keep the previous code */
     }
+    // Captured before qr_visible flips -- "was a QR already up?" decides
+    // fade-in (nothing -> QR) vs. an instant cut (QR -> a different QR),
+    // per the presentation-effect's scope.
+    bool was_visible = qr_visible;
+
     stop_particles();  // mutually exclusive with the QR code on this tile
     stop_message();
 
     qr_visible = true;
-    bsp_display_set_brightness(QR_BACKLIGHT);   // wake the backlight for the QR
+    bsp_display_set_brightness(device_config_get_qr_brightness());   // wake the backlight for the QR
 
     // Computed once, up front -- used for the progress bar's width below
     // AND the purpose caption's position further down, so it's not
@@ -483,6 +542,16 @@ static void show_qr_internal(const char *text, int32_t display_seconds)
         }
     }
 
+    // Presentation: fade in from nothing; cut straight to fully opaque
+    // when replacing an already-visible QR with this new one (scoped
+    // deliberately -- see qr_fade_opa's own comment).
+    if (was_visible) {
+        lv_anim_delete(&qr_fade_opa, NULL);
+        qr_fade_opa = 255;
+    } else {
+        start_qr_fade(255, NULL);
+    }
+
     if (obj_rgb_tile) {
         lv_obj_invalidate(obj_rgb_tile);
     }
@@ -516,7 +585,7 @@ void rgb_tile_show_message(const char *text)
     stop_qr();
     stop_particles();
 
-    bsp_display_set_brightness(QR_BACKLIGHT);   // same level as the QR screen it alternates with -- no brightness flicker
+    bsp_display_set_brightness(device_config_get_qr_brightness());   // same level as the QR screen it alternates with -- no brightness flicker
     if (pairing_message_label) {
         lv_label_set_text(pairing_message_label, text);
         lv_obj_remove_flag(pairing_message_label, LV_OBJ_FLAG_HIDDEN);
@@ -580,13 +649,31 @@ void rgb_tile_hide_particles(void)
  * own mode since nothing else could have been active at the same time. */
 void rgb_tile_idle(void)
 {
-    stop_qr();
     stop_particles();
     stop_message();
-    if (obj_rgb_tile) {
-        lv_obj_invalidate(obj_rgb_tile);
+    if (qr_visible) {
+        // Same "fade out, then actually finish" as hide_qr() -- Idle
+        // taking over from a visible QR is also a "QR -> nothing"
+        // transition, just triggered by a command instead of a timeout.
+        if (qr_tick_timer) lv_timer_pause(qr_tick_timer);
+        start_qr_fade(0, qr_fade_out_completed);
+    } else {
+        // Nothing to fade -- particles/message don't get one, so this is
+        // the same instant blank as before for those.
+        stop_qr();   // harmless no-op; qr_visible is already false
+        if (obj_rgb_tile) {
+            lv_obj_invalidate(obj_rgb_tile);
+        }
+        bsp_display_set_brightness(0);
     }
-    bsp_display_set_brightness(0);
+}
+
+void rgb_tile_apply_qr_brightness(void)
+{
+    bool message_visible = pairing_message_label && !lv_obj_has_flag(pairing_message_label, LV_OBJ_FLAG_HIDDEN);
+    if (qr_visible || message_visible) {
+        bsp_display_set_brightness(device_config_get_qr_brightness());
+    }
 }
 
 /* (Re)generate the solid QR for the particle effect's crossfade overlay.
@@ -613,7 +700,8 @@ void particle_qr_set_overlay_opacity(uint8_t opa)
     // tick (see qrCrossfade in ParticleEffects.swift), so the brightness
     // change tracks the visual crossfade exactly instead of needing its own
     // timer. opa 0 (pure particles) -> PARTICLE_BACKLIGHT; opa 255 (fully
-    // solid QR) -> QR_BACKLIGHT.
-    int brightness = PARTICLE_BACKLIGHT - (PARTICLE_BACKLIGHT - QR_BACKLIGHT) * opa / 255;
+    // solid QR) -> device_config_get_qr_brightness().
+    int qr_brightness = device_config_get_qr_brightness();
+    int brightness = PARTICLE_BACKLIGHT - (PARTICLE_BACKLIGHT - qr_brightness) * opa / 255;
     bsp_display_set_brightness(brightness);
 }

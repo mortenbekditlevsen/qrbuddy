@@ -12,14 +12,12 @@
  * functions in initialize.h, nothing here touches LVGL or needs its port
  * lock).
  *
- * Only one config exists so far (orientation); more are expected (per the
- * SetConfig wire format's own config-type byte) -- each new one is its own
- * get/set pair here plus a new Command case in GATTServer.swift, not a
- * generic blob store. That's deliberate: there's nothing to generalize
- * *from* yet with only one real config type, and each concrete config is
- * different enough (orientation needs a restart to apply; others might
- * not) that a generic store would just hide that per-config behavior
- * rather than simplify anything. */
+ * Each config is its own get/set pair here plus a new Command case in
+ * GATTServer.swift, not a generic blob store. That's deliberate: each
+ * concrete config behaves differently enough on top of its own storage
+ * (orientation needs a restart to apply; QR brightness applies live) that
+ * a generic store would just hide that per-config behavior rather than
+ * simplify anything. */
 
 // Device orientation, in degrees clockwise. Applied once at boot
 // (components/lvgl_ui/initialize.c) from whatever's persisted here --
@@ -58,5 +56,24 @@ bool device_config_set_orientation(uint8_t orientation);
  * rather than cutting it off mid-transmit) after a config change that
  * needs a reboot to take effect. */
 void device_config_schedule_restart(void);
+
+// LCD backlight percentage (0-100) while a QR code is on screen -- both
+// the BLE/command-triggered display and the pairing QR use this (see
+// rgb_tile.c's show_qr_internal()/rgb_tile_show_message()). Unlike
+// orientation, this applies live: rgb_tile.c re-reads it every time it's
+// about to light up the backlight for a QR, and rgb_tile_apply_qr_
+// brightness() (see rgb_tile.h) re-applies it immediately if a QR happens
+// to already be on screen when it's changed -- there's no hardware
+// constraint here forcing a restart the way orientation has.
+#define DEVICE_QR_BRIGHTNESS_DEFAULT 20   // matches this project's original hardcoded QR_BACKLIGHT
+
+/* Returns the persisted QR brightness (0-100), or
+ * DEVICE_QR_BRIGHTNESS_DEFAULT if none is stored yet. */
+uint8_t device_config_get_qr_brightness(void);
+
+/* Persists a new QR brightness. Returns false (and doesn't touch NVS) if
+ * `percent` is out of the 0-100 range -- callers must reject the write,
+ * not clamp it. Doesn't apply it -- see rgb_tile_apply_qr_brightness(). */
+bool device_config_set_qr_brightness(uint8_t percent);
 
 #endif

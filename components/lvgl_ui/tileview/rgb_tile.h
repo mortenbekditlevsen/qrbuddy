@@ -51,6 +51,14 @@ void rgb_tile_hide_particles(void);
  * LVGL port lock (lvgl_port_lock). */
 void rgb_tile_idle(void);
 
+/* Re-applies device_config_get_qr_brightness() to the backlight right now,
+ * if (and only if) a QR is currently on screen (the "real" one or the
+ * pairing/message screens that share its brightness) -- so a SetConfig
+ * QRBrightness change is visible immediately rather than waiting for the
+ * next QR to be shown. A no-op otherwise. Caller must hold the LVGL port
+ * lock (lvgl_port_lock). */
+void rgb_tile_apply_qr_brightness(void);
+
 
 #ifdef __cplusplus
 }

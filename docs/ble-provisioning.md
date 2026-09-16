@@ -183,19 +183,26 @@ error), same as every other command; no ConfigValue follows in that case.
 
 **SetConfig's `config_type` values:**
 
-| Value | Meaning | `value` |
-|---|---|---|
-| `0x00` | Orientation | 1 byte: `0`=0°, `1`=90°, `2`=180°, `3`=270° (clockwise) |
+| Value | Meaning | `value` | Applies |
+|---|---|---|---|
+| `0x00` | Orientation | 1 byte: `0`=0°, `1`=90°, `2`=180°, `3`=270° (clockwise) | After a restart |
+| `0x01` | QRBrightness | 1 byte: backlight percentage, `0`-`100` | Immediately |
 
 Like `purpose`, `config_type` is append-only — a new persisted setting is a
-new value here, never a reused or renumbered one. Unlike every other
-command, **SetConfig doesn't apply immediately** for settings that need it
-(Orientation does): the device persists the new value to flash and
-restarts a moment later to apply it through its normal boot path, rather
-than attempting a live hardware-rotation change. Expect the connection to
-drop when this happens — that's the restart, not a failure. Future config
-types may or may not need a restart to apply; check each one's own
-behavior rather than assuming.
+new value here, never a reused or renumbered one. **Whether a SetConfig
+applies immediately depends on the setting** — Orientation doesn't (this
+display stack has no live hardware-rotation API, so the device persists
+the value and restarts a moment later to apply it through its normal boot
+path instead; expect the connection to drop when this happens, that's the
+restart, not a failure). QRBrightness has no such constraint and applies
+right away, live, to whatever's on screen if a QR (or the pairing QR's
+helper-text screen, which shares the same brightness) happens to already
+be showing. Check each config type's own behavior rather than assuming
+either way for future ones.
+
+QRBrightness controls the backlight level while a QR code (or the pairing
+flow's screens, which share it) is on screen — it does *not* affect the
+particle idle effect's brightness, which stays fixed.
 
 **ShowQR's fields:**
 - `display_seconds`: how long the QR (and its progress bar) stays up before

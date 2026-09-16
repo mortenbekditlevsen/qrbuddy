@@ -45,6 +45,7 @@ private enum QRPurpose: UInt8 {
 /// as opcodes and QRPurpose.
 private enum ConfigType: UInt8 {
     case orientation = 0x00
+    case qrBrightness = 0x01
 }
 
 /// Mirrors device_config.h's DEVICE_ORIENTATION_* values exactly -- raw
@@ -65,6 +66,7 @@ private enum Command {
     case idle
     case demoEffects
     case setOrientation(DeviceOrientation)
+    case setQRBrightness(UInt8)
     case getConfig(ConfigType)
 
     static func parse(_ bytes: [UInt8]) -> Command? {
@@ -92,6 +94,9 @@ private enum Command {
             case .orientation:
                 guard payload.count == 2, let orientation = DeviceOrientation(rawValue: payload[1]) else { return nil }
                 return .setOrientation(orientation)
+            case .qrBrightness:
+                guard payload.count == 2, payload[1] <= 100 else { return nil }
+                return .setQRBrightness(payload[1])
             }
         case 0x05:
             // configType(1), no further payload -- the response (opcode
@@ -125,6 +130,14 @@ private func handle(_ command: Command, connHandle: UInt16) {
         if device_config_set_orientation(orientation.rawValue) {
             device_config_schedule_restart()
         }
+    case .setQRBrightness(let percent):
+        // Applies live -- no hardware constraint like orientation's, so
+        // no restart needed. device_config_set_qr_brightness() only fails
+        // out-of-range, which Command.parse's own `payload[1] <= 100`
+        // check already ruled out.
+        if device_config_set_qr_brightness(percent) {
+            apply_qr_brightness()
+        }
     case .getConfig(let configType):
         // The one deliberate exception to "commands are fire-and-forget,
         // no acknowledgement" (docs/ble-provisioning.md §5b) -- a read
@@ -136,6 +149,8 @@ private func handle(_ command: Command, connHandle: UInt16) {
         switch configType {
         case .orientation:
             sendConfigValue(connHandle: connHandle, configType: .orientation, value: [device_config_get_orientation()])
+        case .qrBrightness:
+            sendConfigValue(connHandle: connHandle, configType: .qrBrightness, value: [device_config_get_qr_brightness()])
         }
     }
 }

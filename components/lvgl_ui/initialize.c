@@ -90,6 +90,15 @@ void show_particles(void) {
     }
 }
 
+void apply_qr_brightness(void) {
+    if (lvgl_port_lock(0)) {
+        rgb_tile_apply_qr_brightness();
+        lvgl_port_unlock();
+    } else {
+        ESP_LOGW(TAG, "apply_qr_brightness: could not acquire LVGL lock");
+    }
+}
+
 void enter_idle(void) {
     if (lvgl_port_lock(0)) {
         rgb_tile_idle();
