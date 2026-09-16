@@ -10,6 +10,13 @@ extern "C" {
 
 void rgb_tile_init(lv_obj_t *parent);
 
+/* Shown once, at the very start of boot (see initialize()), before
+ * anything else on the tile has run -- taken down automatically the first
+ * time any other rgb_tile_show_*() call happens (they all route through
+ * stop_qr()/stop_particles()/stop_message(), which now also clear this).
+ * Caller must hold the LVGL port lock (lvgl_port_lock). */
+void rgb_tile_show_boot_logo(void);
+
 /* Regenerate the QR code from `text` and repaint the tile.
  * Caller must hold the LVGL port lock (lvgl_port_lock). */
 void rgb_tile_show_qr(const char *text);

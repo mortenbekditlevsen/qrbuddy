@@ -8,6 +8,7 @@
 #include "bsp_display.h"
 #include "particle.h"
 #include "device_config.h"
+#include "images/boot_logo.h"
 
 #define QR_VISIBLE_SECONDS 60  // how long the QR code stays on screen
 // Backlight % while a QR code is on screen -- device_config_get_qr_
@@ -78,6 +79,7 @@ static lv_obj_t *obj_rgb_tile;
 static lv_obj_t *qr_progress_bar;      // shrinks from full width as the QR's countdown runs out, hidden while no QR
 static lv_obj_t *pairing_message_label;   // pairing flow's "scan this" helper text, hidden otherwise
 static lv_obj_t *qr_purpose_label;     // ShowQR's per-purpose caption, portrait orientation only -- see show_qr_internal()
+static lv_obj_t *boot_logo_img;        // shown once, at boot -- see rgb_tile_show_boot_logo()
 static lv_timer_t *qr_tick_timer;      // 1 Hz countdown timer, paused while no QR
 static int qr_seconds_left;
 
@@ -320,6 +322,16 @@ static void start_qr_fade(int32_t to, lv_anim_completed_cb_t completed_cb)
 
 /* Stop each effect without touching the backlight — used when the other
  * effect is about to take over and will set its own brightness right after. */
+/* Takes the boot logo down -- called from all three stop_*() below (not
+ * just once at whichever show_*() the caller happens to reach first) so
+ * *any* real content taking over the tile clears it, without every
+ * show_*() needing its own explicit call. Safe to call even if the logo
+ * was never shown (e.g. no boot_logo_img yet, or already hidden). */
+static void stop_boot_logo(void)
+{
+    if (boot_logo_img) lv_obj_add_flag(boot_logo_img, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void stop_qr(void)
 {
     if (qr_tick_timer) lv_timer_pause(qr_tick_timer);
@@ -330,6 +342,7 @@ static void stop_qr(void)
     if (qr_purpose_label) {
         lv_obj_add_flag(qr_purpose_label, LV_OBJ_FLAG_HIDDEN);
     }
+    stop_boot_logo();
 }
 
 static void stop_particles(void)
@@ -337,11 +350,13 @@ static void stop_particles(void)
     if (particle_tick_timer) lv_timer_pause(particle_tick_timer);
     particles_active = false;
     particle_qr_overlay_opa = 0;   // don't let a stale crossfade linger into the next activation
+    stop_boot_logo();
 }
 
 static void stop_message(void)
 {
     if (pairing_message_label) lv_obj_add_flag(pairing_message_label, LV_OBJ_FLAG_HIDDEN);
+    stop_boot_logo();
 }
 
 /* Finishes taking the QR off screen once its fade-out (see hide_qr()/
@@ -457,9 +472,47 @@ void rgb_tile_init(lv_obj_t *parent)
     lv_obj_set_width(qr_purpose_label, lv_pct(90));
     lv_obj_add_flag(qr_purpose_label, LV_OBJ_FLAG_HIDDEN);
 
+    // The boot logo -- see rgb_tile_show_boot_logo(). A plain lv_image, not
+    // custom-drawn like the QR/particles; boot_logo (boot_logo.c) is
+    // generated ahead of time from a 240x240 PNG, so this is just "show a
+    // static image", not real work.
+    boot_logo_img = lv_image_create(parent);
+    lv_image_set_src(boot_logo_img, &boot_logo);
+    lv_obj_center(boot_logo_img);
+    lv_obj_add_flag(boot_logo_img, LV_OBJ_FLAG_HIDDEN);
+
     lv_obj_add_event_cb(parent, rgb_tile_draw_event_cb, LV_EVENT_DRAW_POST, NULL);
 
-    rgb_tile_show_qr("https://ka-ching.dk");
+//    rgb_tile_show_qr("https://ka-ching.dk");
+}
+
+/* Shown once, at the very start of boot (see initialize()). Taken down
+ * automatically the first time any other rgb_tile_show_*() call happens
+ * (see stop_boot_logo(), called from stop_qr()/stop_particles()/
+ * stop_message()). The caller MUST already hold the LVGL port lock
+ * (lvgl_port_lock). */
+void rgb_tile_show_boot_logo(void)
+{
+    // QR/particles are custom-drawn via rgb_tile_draw_event_cb on
+    // LV_EVENT_DRAW_POST, which paints *after* (so on top of) every child
+    // widget -- including boot_logo_img below -- regardless of that
+    // widget's own hidden flag. rgb_tile_init()'s own trailing
+    // rgb_tile_show_qr() call leaves qr_visible true, so without this the
+    // QR would still be actively drawn straight over the logo. stop_qr()
+    // clears that; stop_particles()/stop_message() are here too only for
+    // symmetry with every other show_*() in this file (harmless --
+    // nothing's shown that early to actually stop).
+    stop_qr();
+    stop_particles();
+    stop_message();
+
+    bsp_display_set_brightness(PARTICLE_BACKLIGHT);   // full brightness -- a splash screen, not a QR/message level
+    if (boot_logo_img) {
+        lv_obj_remove_flag(boot_logo_img, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (obj_rgb_tile) {
+        lv_obj_invalidate(obj_rgb_tile);
+    }
 }
 
 /* Shared by rgb_tile_show_qr()/rgb_tile_show_qr_persistent()/

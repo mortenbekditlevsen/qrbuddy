@@ -18,7 +18,11 @@
 /// gesture is actually being performed.
 private func checkUpsideDownPairingReset() {
     let pollIntervalTicks: UInt32 = 10   // 100ms at CONFIG_FREERTOS_HZ=100
-    let requiredGoodPolls = 50           // 50 * 100ms = 5s of (tolerantly) continuous upside-down
+    // 50 * 100ms = 5s of (tolerantly) continuous upside-down -- initialize.c's
+    // boot-logo hold (components/lvgl_ui/initialize.c) is deliberately the
+    // same 5s, so the logo stays up for exactly as long as this check takes
+    // to decide. Change one, change the other.
+    let requiredGoodPolls = 50
     let maxBadStreak = 3                 // ~300ms of consecutive contrary readings before giving up
 
     // Physically flipping the device by hand adds real rotational/dynamic
@@ -60,7 +64,7 @@ private var pairingQRPayload: String?
 private var pairingAlternateShowingQR = true
 private var pairingAlternateTicksElapsed: UInt32 = 0
 private let pairingAlternateIntervalTicks: UInt32 = 500   // 5s at 10ms/tick
-private let pairingHelperText = "Scan koden under Indstillinger -> QRBuddy i Ka-ching POS for at forbinde"
+private let pairingHelperText = "Scan koden under Indstillinger -> QRBuddy i Ka-ching POS for at forbinde."
 
 /// Called every main-loop tick (~10ms). A no-op once pairingQRPayload is
 /// nil (nothing to alternate) or the window has closed (paired, timed out,

@@ -1,5 +1,8 @@
 #include <stdio.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_check.h"
@@ -172,6 +175,23 @@ void initialize(void)
     if (lvgl_port_lock(0))
     {
         lvgl_ui_init();
+        rgb_tile_show_boot_logo();  // must run inside the lock, same as show_qr()/show_particles()
+        lvgl_port_unlock();
+    }
+    // Hold the boot logo on screen before the normal boot flow (particles,
+    // or the pairing QR -- decided by app_main(), after this function
+    // returns) takes over. A plain blocking delay, not a timer: this only
+    // ever runs once, right here, so there's no need for anything fancier
+    // -- and it keeps the logo genuinely the first thing shown for a fixed
+    // duration, independent of however long BLE/pairing setup takes
+    // afterward. 5s to match checkUpsideDownPairingReset()'s own
+    // requiredGoodPolls window (Main.swift) -- how long it takes to know
+    // whether this boot is a re-pair gesture -- not an independent number
+    // that could drift from it.
+    vTaskDelay(500);   // 5s at CONFIG_FREERTOS_HZ=100 (10ms/tick)
+
+    if (lvgl_port_lock(0))
+    {
         rgb_tile_show_particles();  // must run inside the lock, same as show_qr()
         lvgl_port_unlock();
     }
