@@ -122,6 +122,20 @@ internal func restartAdvertising() -> Int32 {
     )
 }
 
+/// Force-closes one connection. NimBLE stops advertising the instant a
+/// central connects and this file only resumes it on disconnect (see
+/// restartAdvertising() above) -- so only one central can ever be reachable
+/// at a time. That means a client that's no longer trusted (e.g. it
+/// auto-reconnected and tried to Resume right after a re-pair reset, see
+/// Pairing.swift's handleResumeHello) can end up permanently occupying the
+/// device's only connection slot, leaving no way for a legitimate new
+/// client to ever get in. Terminating that connection triggers
+/// BLE_GAP_EVENT_DISCONNECT, which puts advertising back up.
+@discardableResult
+internal func terminateConnection(_ connHandle: UInt16) -> Int32 {
+    ble_gap_terminate(connHandle, UInt8(BLE_ERR_REM_USER_CONN_TERM.rawValue))
+}
+
 internal func _gap_callback(event: UnsafeMutablePointer<ble_gap_event>?, context: UnsafeMutableRawPointer?) -> Int32 {
     guard let event else { return 0 }
 

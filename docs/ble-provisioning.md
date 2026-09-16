@@ -137,6 +137,34 @@ established" itself and treats undecryptable/absent-session/malformed
 traffic as a no-op (a normal ATT write-response error, not an
 application-level Nack).
 
+One more characteristic, also under the control service, but *not*
+encrypted or session-gated — plain JSON, readable before pairing:
+
+| Characteristic | Properties | Purpose |
+|---|---|---|
+| `DEVICE_INFO` | Read | A small JSON object describing this firmware build — see below. |
+
+```json
+{"version":"1.0.0","apiVersion":1,"capabilities":["ShowQR","Idle","DemoEffects","SetConfig","GetConfig"]}
+```
+
+- `version`: this firmware build's own version. Bumped on release; can
+  change without the wire protocol itself changing at all (a new particle
+  effect, copy changes, bugfixes).
+- `apiVersion`: the wire protocol's own version (this document). Only
+  bumped for a change that could break an existing client — a new opcode
+  or a new SetConfig `config_type` is additive and doesn't bump this;
+  that's exactly what `capabilities` is for instead.
+- `capabilities`: which `CMD` opcodes (by name, matching §5b's table)
+  this build actually implements. A client can use this to detect "this
+  device is too old to support DemoEffects" without needing an
+  `apiVersion` bump for every additive change.
+
+This is deliberately plaintext and readable without pairing — none of it
+is sensitive, and a client benefits from being able to check version/
+capability compatibility before going through pairing at all, the same
+reasoning as `PROV_STATE` already being unencrypted.
+
 ## 5. Handshake wire format
 
 Single byte opcode, followed by a fixed-layout payload (all multi-byte
@@ -153,6 +181,18 @@ integers little-endian; all keys/tags raw bytes, not base64, over BLE):
 | `0x07` | ResumeClientConfirm | App → Device | `confirm_tag_client`(16) |
 | `0x08` | ResumeComplete | Device → App | *(empty)* |
 | `0x7F` | Nack | Device → App | `reason`(1): `1`=not paired, `2`=bad confirm, `3`=pairing window closed, `4`=rate-limited |
+
+`Nack(not paired)` specifically (a `ResumeHello` rejected because the
+device holds no trust, or trust for a different `client_id`) is followed by
+the device closing the connection. Advertising only comes back up once a
+connection ends (NimBLE stops it the instant any central connects and
+nothing here restarts it while one is still open), so a client that keeps
+resuming against trust that's gone would otherwise permanently occupy the
+device's one reachable slot — most concretely, a previously-paired phone
+auto-reconnecting in the background right after a re-pair reset (§3c),
+locking out the new phone that's supposed to complete the fresh pairing. A
+client should treat this disconnect as expected, not an error: drop into
+the pairing flow per §10 point 7 rather than retrying Resume on reconnect.
 
 ## 5b. Command opcodes (`CMD`, post-pairing)
 
@@ -367,6 +407,15 @@ already-advertised control service UUID, so the app can `scanForPeripherals
    `ResumeClientConfirm` attempts and pairing-window age; enforce §7's
    limits by sending `Nack` and, once exceeded, closing the window (back to
    whatever the device would otherwise be showing).
+10. **`DEVICE_INFO`**: a plain read-only characteristic, registered
+    alongside `CMD`/`PROV_STATE`/`PROV_HANDSHAKE` in the same
+    `setupGATTServer()` (see `DeviceInfo.swift`) — unlike everything else,
+    this one is deliberately *not* encrypted or session-gated, so its
+    access callback only needs to handle a plain read and hand back the
+    JSON bytes (§4). The version/apiVersion/capabilities values are hand-
+    maintained constants, not derived from anything at build time — bump
+    `apiVersion` only for a wire-breaking change, and keep `capabilities`
+    in sync by hand whenever a `Command` case is added or removed.
 
 ## 10. Client implementation path
 
@@ -388,12 +437,22 @@ already-advertised control service UUID, so the app can `scanForPeripherals
    `client_id`/`LTK` — no user interaction, no QR.
 6. **Sending commands**: build `[opcode][payload]` per §5b, encrypt with the
    per-connection `session_key` and the nonce/framing scheme in §6, write to
-   `CMD`. Write-only, no response payload to read back — a failed write
-   (bad session, unknown opcode, malformed payload) surfaces as a normal
-   ATT write error.
-7. **Error/UX handling**:
+   `CMD`. Almost every command is fire-and-forget — no response payload to
+   read back, and a failed write (bad session, unknown opcode, malformed
+   payload) surfaces as a normal ATT write error. The one exception is
+   `GetConfig` (0x05): subscribe to notifications on `CMD` (it's `Write,
+   Notify`) before sending it, and expect a `ConfigValue` (0x06) response
+   back on the same characteristic, encrypted the same as everything else.
+7. **`DEVICE_INFO`**: a plain, unencrypted read — no pairing or session
+   required — that can be done as soon as the device is connected, even
+   before running the pairing/resume flow above. Useful to check
+   `apiVersion`/`capabilities` (§4) match what the client expects before
+   bothering the user with a pairing prompt.
+8. **Error/UX handling**:
    - `Nack(not paired)` on resume → drop into the pairing flow, prompt the
-     user to scan the QR again (covers first-ever use and post-reset).
+     user to scan the QR again (covers first-ever use and post-reset). The
+     device disconnects right after sending this Nack (§5); expect that
+     rather than treating it as a lost connection to recover from.
    - `Nack(bad confirm)` / `Nack(rate-limited)` during pairing → surface a
      clear retry prompt (wrong/expired code).
    - Handle a mid-handshake disconnect by just retrying the whole handshake

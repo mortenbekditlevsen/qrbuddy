@@ -524,6 +524,21 @@ static void show_qr_internal(const char *text, int32_t display_seconds)
     switch (qr_purpose) {
     case 0x00: caption = "Hent kvittering"; break;      // Receipt
     case 0x01: caption = "MobilePay"; break;            // MobilePay
+    case 0x02: caption = "AcountPay"; break;            // AcountPay
+    case 0x03: caption = "Hent gavekort"; break;        // Giftcard
+    case 0x04: caption = "Hent loyalitetskort"; break;  // Loyalty card
+    case 0x05: caption = "Hent kupon"; break;           // Coupon
+    case 0x06: caption = "Bliv medlem"; break;          // Membership signup
+
+    /*
+        case receipt = 0x00
+    case mobilePay = 0x01
+    case accountPay = 0x02
+    case giftCard = 0x03
+    case loyaltyCard = 0x04
+    case coupon = 0x05
+    case membershipSignup = 0x06
+*/
     case QR_PURPOSE_PAIRING: caption = "Scan med Ka-ching POS"; break;
     default: break;                                      // stub -- no caption yet
     }

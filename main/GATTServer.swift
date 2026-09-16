@@ -219,13 +219,14 @@ func command_access_cb(
 /// Call this after `NimBLE()` init and before `bluetooth.gap.startAdvertising()`.
 func setupGATTServer() throws(NimBLEError) {
     // One service, every characteristic (CMD + the provisioning pair from
-    // Pairing.swift) in a single array -- NOT separate ble_gatts_add_svcs()
-    // calls that both use controlServiceUUIDString. NimBLE doesn't
-    // deduplicate service registrations by UUID, so that would create two
-    // distinct services sharing a UUID, and most client code discovering
-    // "the" service with that UUID would only ever see one of them.
-    let pairingChrs = pairingCharacteristics()
-    let characteristics = UnsafeMutablePointer<ble_gatt_chr_def>.allocate(capacity: 1 + pairingChrs.count + 1)
+    // Pairing.swift + DEVICE_INFO from DeviceInfo.swift) in a single array
+    // -- NOT separate ble_gatts_add_svcs() calls that all use
+    // controlServiceUUIDString. NimBLE doesn't deduplicate service
+    // registrations by UUID, so that would create multiple distinct
+    // services sharing a UUID, and most client code discovering "the"
+    // service with that UUID would only ever see one of them.
+    let extraChrs = pairingCharacteristics() + deviceInfoCharacteristics()
+    let characteristics = UnsafeMutablePointer<ble_gatt_chr_def>.allocate(capacity: 1 + extraChrs.count + 1)
 
     characteristics[0] = ble_gatt_chr_def(
         uuid: makeNimBLEUUID(commandUUIDString),
@@ -237,10 +238,10 @@ func setupGATTServer() throws(NimBLEError) {
         val_handle: &commandHandle,
         cpfd: nil
     )
-    for (i, chr) in pairingChrs.enumerated() {
+    for (i, chr) in extraChrs.enumerated() {
         characteristics[1 + i] = chr
     }
-    characteristics[1 + pairingChrs.count] = ble_gatt_chr_def()   // zeroed sentinel (uuid == nil)
+    characteristics[1 + extraChrs.count] = ble_gatt_chr_def()   // zeroed sentinel (uuid == nil)
 
     let services = UnsafeMutablePointer<ble_gatt_svc_def>.allocate(capacity: 2)
     services[0] = ble_gatt_svc_def(

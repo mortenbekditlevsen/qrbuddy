@@ -108,4 +108,5 @@ target_sources(${COMPONENT_LIB}
     LED.swift
     ParticleEffects.swift
     Pairing.swift
+    DeviceInfo.swift
 )

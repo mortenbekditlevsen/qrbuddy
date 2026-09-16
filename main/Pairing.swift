@@ -351,7 +351,16 @@ private func handleResumeHello(connHandle: UInt16, payload: [UInt8]) {
     let clientID = Array(payload[0 ..< Int(PAIRING_CLIENT_ID_LEN)])
     let clientPub = Array(payload[Int(PAIRING_CLIENT_ID_LEN)...])
     guard haveTrust, storedID == clientID else {
+        // This is exactly the shape of a stale client auto-reconnecting
+        // after a re-pair reset: it still thinks it's paired and tries to
+        // Resume, but the trust it's resuming against is gone (or belongs
+        // to a different client). Advertising doesn't come back up while
+        // any connection is open (see NimBLE.swift), so if we just left
+        // this one sitting here, it would permanently block a legitimate
+        // new client from ever connecting to go through the real pairing
+        // flow. Kick it after the Nack so the slot frees up.
         sendNack(connHandle: connHandle, reason: .notPaired)
+        terminateConnection(connHandle)
         return
     }
 
