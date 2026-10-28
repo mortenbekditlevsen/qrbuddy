@@ -146,11 +146,17 @@ void initialize(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Persisted orientation (device_config_*, NVS-backed) -- see
-    // docs/ble-provisioning.md's SetConfig command. Resolved once, here,
-    // and fed into both bsp_display_init()'s buffer sizing and
-    // app_lvgl_init()'s disp_cfg below.
-    uint8_t orientation = device_config_get_orientation();
+    // Badge build: always portrait, regardless of whatever's persisted in
+    // NVS -- this branch has no pairing/BLE command flow wired up for now
+    // (see app_main()), so there's no way to SetConfig an orientation here
+    // anyway. device_config_get_orientation()/SetConfig's orientation
+    // handling (main/GATTServer.swift, components/device_config) are
+    // otherwise untouched -- revert this one line to
+    // `device_config_get_orientation()` if/when this branch gets BLE
+    // config back. DEVICE_ORIENTATION_0 is a guess at "right side up" as
+    // worn -- flip to DEVICE_ORIENTATION_180 here if it's upside down on
+    // the badge.
+    uint8_t orientation = DEVICE_ORIENTATION_0;
     int32_t lcd_h_res, lcd_v_res;
     if (orientation == DEVICE_ORIENTATION_90 || orientation == DEVICE_ORIENTATION_270) {
         lcd_h_res = 280;
@@ -170,7 +176,7 @@ void initialize(void)
     bsp_qmi8658_init(i2c_bus_handle);
 
     bsp_display_brightness_init();
-    bsp_display_set_brightness(40);
+    bsp_display_set_brightness(100);
 
     // A restart specifically triggered by device_config_schedule_restart()
     // (currently: applying a newly-set orientation -- SetConfig, see

@@ -83,4 +83,21 @@ void particle_qr_prepare(const char *text);
  * out again before the particle effect moves on to the next shape. */
 void particle_qr_set_overlay_opacity(uint8_t opa);
 
+/* Implemented in rgb_tile.c. Shows/hides the same static boot-logo image
+ * rgb_tile_show_boot_logo() uses, but without that function's side effects
+ * (stop_qr()/stop_particles()/stop_message()) -- those don't apply here,
+ * since this is called *from inside* the particle system (see
+ * ParticleEffects.swift's .bootLogo case), which is already the active
+ * top-level mode throughout. Toggled once per transition (beginTransition()
+ * in ParticleEffects.swift), not every tick -- visibility doesn't need a
+ * per-frame update, just an edge trigger when .bootLogo becomes (or stops
+ * being) the current effect. */
+void particle_boot_logo_set_visible(bool visible);
+
+/* Same idea, for a fixed-text label slide (see ParticleEffects.swift's
+ * .helloText case). Its text is set once, in rgb_tile_init() -- there's
+ * no per-call text argument here, unlike rgb_tile_show_message(), since
+ * (unlike that one) this label's content never changes. */
+void particle_hello_set_visible(bool visible);
+
 #endif

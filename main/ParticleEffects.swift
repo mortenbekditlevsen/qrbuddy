@@ -84,10 +84,12 @@ enum CurrentParticleEffect {
     case sphere(Sphere)
     case cube(Cube)
     case spirograph(Spirograph)
+    case bootLogo   // the static boot_logo image (components/lvgl_ui/images), shown as a slide in the rotation -- see particle_boot_logo_set_visible()
+    case helloText  // fixed-text label slide ("Hello! My name is Morten...") -- see particle_hello_set_visible()
     case qr(String)   // the URL to encode; regenerated (cached) only when it changes
 }
 
-private var currentEffect: CurrentParticleEffect = .starfield(Starfield())
+private var currentEffect: CurrentParticleEffect = .helloText
 private var previousEffect: CurrentParticleEffect?   // kept "alive" (still ticking) during a blend-out
 
 // TEST ONLY: cycle through effects every 5s so they're all easy to see
@@ -178,6 +180,8 @@ private func springDampFor(_ effect: CurrentParticleEffect) -> (k: Float, dampin
     case .sphere:    return (Sphere.springK, Sphere.damping)
     case .cube:      return (Cube.springK, Cube.damping)
     case .spirograph: return (Spirograph.springK, Spirograph.damping)
+    case .bootLogo:  return (Sphere.springK, Sphere.damping)  // never applied -- bootLogo's tick() always returns 0 particles
+    case .helloText: return (Sphere.springK, Sphere.damping)  // same -- helloText's tick() also always returns 0
     case .qr:        return (Sphere.springK, Sphere.damping)  // same "settle into formation" role as sphere/cube
     }
 }
@@ -205,6 +209,10 @@ private func tick(_ effect: inout CurrentParticleEffect, tileW: Int32, tileH: In
         let n = e.targets(tileW: tileW, tileH: tileH, into: &out)
         effect = .spirograph(e)
         return n
+    case .bootLogo:
+        return 0   // nothing to draw as particles -- particle_boot_logo_set_visible() (beginTransition()) shows the image instead
+    case .helloText:
+        return 0   // same idea -- particle_hello_set_visible() (beginTransition()) shows the label instead
     case .qr:
         return qrTargets(tileW: tileW, tileH: tileH, into: &out)
     }
@@ -237,11 +245,24 @@ private func parkedTarget(_ i: Int, tileW: Int32, tileH: Int32) -> SlotTarget {
 /// Resets whichever effect `currentEffect` currently is, and (re)arms the
 /// per-particle stagger delays for a fresh transition.
 private func beginTransition(tileW: Int32, tileH: Int32) {
+    // Only the matching case below re-shows either of these -- every other
+    // effect (plus a fresh reset landing back on .bootLogo/.helloText
+    // between tick() calls, e.g. right after a ShowQR/DemoEffects
+    // interruption) wants both hidden. Edge-triggered here, once per
+    // transition, rather than every tick -- see particle_boot_logo_set_
+    // visible()'s own comment.
+    particle_boot_logo_set_visible(false)
+    particle_hello_set_visible(false)
+
     switch currentEffect {
     case .starfield(var e): e.reset(tileW: tileW, tileH: tileH); currentEffect = .starfield(e)
     case .sphere(var e):    e.reset(tileW: tileW, tileH: tileH); currentEffect = .sphere(e)
     case .cube(var e):      e.reset(tileW: tileW, tileH: tileH); currentEffect = .cube(e)
     case .spirograph(var e): e.reset(tileW: tileW, tileH: tileH); currentEffect = .spirograph(e)
+    case .bootLogo:
+        particle_boot_logo_set_visible(true)
+    case .helloText:
+        particle_hello_set_visible(true)
     case .qr(let url):
         // Encode right away (not lazily at crossfade time) so
         // particle_qr_modules() is valid from this effect's very first tick
@@ -298,8 +319,14 @@ func particle_effect_tick(
 
         case .spirograph: currentEffect = .cube(Cube())
 
-        case .cube:       currentEffect = .starfield(Starfield())
-    
+        case .cube:       currentEffect = .bootLogo
+
+        // Two closing slides before the rotation loops back to starfield --
+        // same ticksPerEffect duration as starfield/sphere/cube (no
+        // override needed, unlike spirograph's longer one above).
+        case .bootLogo:   currentEffect = .helloText
+        case .helloText:  currentEffect = .starfield(Starfield())
+
         // .qr is no longer part of the DemoEffects auto-cycle (dropped per
         // request) -- kept here only for CurrentParticleEffect's switch
         // exhaustiveness. Currently unreachable: nothing else switches

@@ -80,6 +80,7 @@ static lv_obj_t *qr_progress_bar;      // shrinks from full width as the QR's co
 static lv_obj_t *pairing_message_label;   // pairing flow's "scan this" helper text, hidden otherwise
 static lv_obj_t *qr_purpose_label;     // ShowQR's per-purpose caption, portrait orientation only -- see show_qr_internal()
 static lv_obj_t *boot_logo_img;        // shown once, at boot -- see rgb_tile_show_boot_logo()
+static lv_obj_t *hello_label;          // the "hello" particle-rotation slide -- see particle_hello_set_visible()
 static lv_timer_t *qr_tick_timer;      // 1 Hz countdown timer, paused while no QR
 static int qr_seconds_left;
 
@@ -332,6 +333,15 @@ static void stop_boot_logo(void)
     if (boot_logo_img) lv_obj_add_flag(boot_logo_img, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* Same idea as stop_boot_logo(), for the "hello" particle-rotation slide
+ * (see particle_hello_set_visible()) -- a separate label from pairing_
+ * message_label, not a reuse of it: that one's text changes per-call for
+ * the real pairing flow, and this one's is fixed, set once at creation. */
+static void stop_hello(void)
+{
+    if (hello_label) lv_obj_add_flag(hello_label, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void stop_qr(void)
 {
     if (qr_tick_timer) lv_timer_pause(qr_tick_timer);
@@ -343,6 +353,7 @@ static void stop_qr(void)
         lv_obj_add_flag(qr_purpose_label, LV_OBJ_FLAG_HIDDEN);
     }
     stop_boot_logo();
+    stop_hello();
 }
 
 static void stop_particles(void)
@@ -351,12 +362,14 @@ static void stop_particles(void)
     particles_active = false;
     particle_qr_overlay_opa = 0;   // don't let a stale crossfade linger into the next activation
     stop_boot_logo();
+    stop_hello();
 }
 
 static void stop_message(void)
 {
     if (pairing_message_label) lv_obj_add_flag(pairing_message_label, LV_OBJ_FLAG_HIDDEN);
     stop_boot_logo();
+    stop_hello();
 }
 
 /* Finishes taking the QR off screen once its fade-out (see hide_qr()/
@@ -481,6 +494,21 @@ void rgb_tile_init(lv_obj_t *parent)
     lv_obj_center(boot_logo_img);
     lv_obj_add_flag(boot_logo_img, LV_OBJ_FLAG_HIDDEN);
 
+    // The "hello" particle-rotation slide -- see particle_hello_set_
+    // visible(). A separate label from pairing_message_label (same
+    // styling, deliberately), not a reuse of it -- its text is fixed, set
+    // once here, rather than per-call the way the real pairing flow's
+    // message is.
+    hello_label = lv_label_create(parent);
+    lv_obj_set_style_text_font(hello_label, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(hello_label, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_align(hello_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_label_set_long_mode(hello_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hello_label, lv_pct(80));
+    lv_label_set_text(hello_label, "Hi there!\nMy name is Morten and I like Swift!\nSwift on the Server\nEmbedded Swift\nSwift WASM\nSwift everywhere!");
+    lv_obj_center(hello_label);
+    lv_obj_add_flag(hello_label, LV_OBJ_FLAG_HIDDEN);
+
     lv_obj_add_event_cb(parent, rgb_tile_draw_event_cb, LV_EVENT_DRAW_POST, NULL);
 
 //    rgb_tile_show_qr("https://ka-ching.dk");
@@ -509,6 +537,42 @@ void rgb_tile_show_boot_logo(void)
     bsp_display_set_brightness(PARTICLE_BACKLIGHT);   // full brightness -- a splash screen, not a QR/message level
     if (boot_logo_img) {
         lv_obj_remove_flag(boot_logo_img, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (obj_rgb_tile) {
+        lv_obj_invalidate(obj_rgb_tile);
+    }
+}
+
+/* Same image, toggled from inside the particle system (Swift's
+ * CurrentParticleEffect.bootLogo case) -- deliberately doesn't call
+ * stop_qr()/stop_particles()/stop_message() the way rgb_tile_show_boot_
+ * logo() does, since particles are already the active top-level mode for
+ * the whole rotation this is part of. See particle.h for the full
+ * rationale. */
+void particle_boot_logo_set_visible(bool visible)
+{
+    if (!boot_logo_img) return;
+    if (visible) {
+        lv_obj_remove_flag(boot_logo_img, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(boot_logo_img, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (obj_rgb_tile) {
+        lv_obj_invalidate(obj_rgb_tile);
+    }
+}
+
+/* Same idea, for the "hello" slide's fixed-text label (see
+ * CurrentParticleEffect.helloText and hello_label's creation in
+ * rgb_tile_init() -- its text never changes, so there's nothing to pass
+ * here, unlike rgb_tile_show_message()). */
+void particle_hello_set_visible(bool visible)
+{
+    if (!hello_label) return;
+    if (visible) {
+        lv_obj_remove_flag(hello_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(hello_label, LV_OBJ_FLAG_HIDDEN);
     }
     if (obj_rgb_tile) {
         lv_obj_invalidate(obj_rgb_tile);

@@ -108,18 +108,16 @@ func app_main() {
         try setupGATTServer()
         print("GATT server registered")
 
-        // First boot ever (or right after a re-pair reset): no trusted
-        // client stored, so show the pairing QR immediately instead of the
-        // usual idle particle effect. See docs/ble-provisioning.md.
-        if let pop = pairingStartupCheck() {
-            let name = "Ka-ching " + address.description
-            let payload = "{\"v\":1,\"name\":\"\(name)\",\"svc\":\"\(controlServiceUUIDString)\",\"pop\":\"\(pop)\"}"
-            print("Awaiting pairing. POP: \(pop)")
-            pairingQRPayload = payload
-            pairingAlternateShowingQR = true
-            pairingAlternateTicksElapsed = 0
-            payload.withCString { show_qr_persistent($0) }
-        }
+        // Badge build: no pairing flow for now -- skip showing the pairing
+        // QR entirely and just let the demo-effects rotation (already
+        // running, from initialize()'s own boot sequence) keep going.
+        // Still calling pairingStartupCheck() itself (not removing it, or
+        // anything else about pairing) so the underlying mechanism --
+        // trust/window bookkeeping, and the BLE command interface a future
+        // small helper app might reuse for customizing effects -- stays
+        // exactly as functional as it already was; only this one display
+        // decision is skipped. See docs/ble-provisioning.md.
+        _ = pairingStartupCheck()
 
         // Advertise the control service UUID so a central (e.g. an iOS app doing
         // scanForPeripherals(withServices:)) can discover and filter for us.
